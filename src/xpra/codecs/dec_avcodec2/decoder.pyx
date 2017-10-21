@@ -1,33 +1,23 @@
 # This file is part of Xpra.
-# Copyright (C) 2012, 2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2012-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
+#cython: auto_pickle=False, wraparound=False, cdivision=True
+
+import errno
 import weakref
-from xpra.log import Logger, debug_if_env
-log = Logger()
-debug = debug_if_env(log, "XPRA_AVCODEC_DEBUG")
-error = log.error
+from xpra.log import Logger
+log = Logger("decoder", "avcodec")
 
-#some consumers need a writeable buffer (ie: OpenCL...)
-READ_ONLY = False
-
-from xpra.codecs.codec_constants import get_subsampling_divs, get_colorspace_from_avutil_enum, RGB_FORMATS
+from xpra.os_util import bytestostr
+from xpra.codecs.codec_constants import get_subsampling_divs
 from xpra.codecs.image_wrapper import ImageWrapper
+from xpra.codecs.libav_common.av_log cimport override_logger, restore_logger, av_error_str #@UnresolvedImport
+from xpra.codecs.libav_common.av_log import suspend_nonfatal_logging, resume_nonfatal_logging
+from xpra.buffers.membuf cimport memalign, object_as_buffer, memory_as_pybuffer
 
-
-include "constants.pxi"
-
-cdef extern from *:
-    ctypedef unsigned long size_t
-    ctypedef unsigned char uint8_t
-
-cdef extern from "Python.h":
-    ctypedef int Py_ssize_t
-    ctypedef object PyObject
-    object PyBuffer_FromMemory(void *ptr, Py_ssize_t size)
-    object PyBuffer_FromReadWriteMemory(void *ptr, Py_ssize_t size)
-    int PyObject_AsReadBuffer(object obj, void ** buffer, Py_ssize_t * buffer_len) except -1
+from libc.stdint cimport uintptr_t, uint8_t
 
 
 cdef extern from "string.h":
@@ -35,37 +25,39 @@ cdef extern from "string.h":
     void * memset(void * ptr, int value, size_t num) nogil
     void free(void * ptr) nogil
 
-
-cdef extern from "../inline.h":
-    pass
-
-cdef extern from "../memalign/memalign.h":
-    void *xmemalign(size_t size)
-
-
-ctypedef long AVPixelFormat
-
-
 cdef extern from "libavutil/mem.h":
     void av_free(void *ptr)
-
-cdef extern from "libavutil/error.h":
-    int av_strerror(int errnum, char *errbuf, size_t errbuf_size)
 
 cdef extern from "libavcodec/version.h":
     int LIBAVCODEC_VERSION_MAJOR
     int LIBAVCODEC_VERSION_MINOR
     int LIBAVCODEC_VERSION_MICRO
 
+#why can't we define this inside the avcodec.h section? (beats me)
+ctypedef unsigned int AVCodecID
+ctypedef long AVPixelFormat
+
+cdef extern from "libavutil/pixfmt.h":
+    AVPixelFormat AV_PIX_FMT_NONE
+    AVPixelFormat AV_PIX_FMT_YUV420P
+    AVPixelFormat AV_PIX_FMT_YUV422P
+    AVPixelFormat AV_PIX_FMT_YUV444P
+    AVPixelFormat AV_PIX_FMT_RGB24
+    AVPixelFormat AV_PIX_FMT_0RGB
+    AVPixelFormat AV_PIX_FMT_BGR0
+    AVPixelFormat AV_PIX_FMT_ARGB
+    AVPixelFormat AV_PIX_FMT_BGRA
+    AVPixelFormat AV_PIX_FMT_GBRP
+
 cdef extern from "libavcodec/avcodec.h":
+    int CODEC_FLAG2_FAST
+
     ctypedef struct AVFrame:
         uint8_t **data
         int *linesize
         int format
         void *opaque
     ctypedef struct AVCodec:
-        pass
-    ctypedef struct AVCodecID:
         pass
     ctypedef struct AVDictionary:
         pass
@@ -84,10 +76,11 @@ cdef extern from "libavcodec/avcodec.h":
         int flags2
         int refcounted_frames
 
-    AVPixelFormat PIX_FMT_NONE
-    AVCodecID CODEC_ID_H264
-    AVCodecID CODEC_ID_VP8
-    #AVCodecID CODEC_ID_VP9
+    AVCodecID AV_CODEC_ID_H264
+    AVCodecID AV_CODEC_ID_H265
+    AVCodecID AV_CODEC_ID_VP8
+    AVCodecID AV_CODEC_ID_VP9
+    AVCodecID AV_CODEC_ID_MPEG4
 
     #init and free:
     void avcodec_register_all()
@@ -101,81 +94,124 @@ cdef extern from "libavcodec/avcodec.h":
     #actual decoding:
     void av_init_packet(AVPacket *pkt) nogil
     void avcodec_get_frame_defaults(AVFrame *frame) nogil
-    int avcodec_decode_video2(AVCodecContext *avctx, AVFrame *picture,
-                                int *got_picture_ptr, const AVPacket *avpkt) nogil
+    int avcodec_send_packet(AVCodecContext *avctx, const AVPacket *avpkt) nogil
+    int avcodec_receive_frame(AVCodecContext *avctx, AVFrame *frame) nogil
 
     void av_frame_unref(AVFrame *frame) nogil
 
 
-COLORSPACES = None
-FORMAT_TO_ENUM = {}
+FORMAT_TO_ENUM = {
+            "YUV420P"   : AV_PIX_FMT_YUV420P,
+            "YUV422P"   : AV_PIX_FMT_YUV422P,
+            "YUV444P"   : AV_PIX_FMT_YUV444P,
+            "RGB"       : AV_PIX_FMT_RGB24,
+            "XRGB"      : AV_PIX_FMT_0RGB,
+            "BGRX"      : AV_PIX_FMT_BGR0,
+            "ARGB"      : AV_PIX_FMT_ARGB,
+            "BGRA"      : AV_PIX_FMT_BGRA,
+            "GBRP"      : AV_PIX_FMT_GBRP,
+            }
+#for planar formats, this is the number of bytes per channel
+BYTES_PER_PIXEL = {
+    AV_PIX_FMT_YUV420P  : 1,
+    AV_PIX_FMT_YUV422P  : 1,
+    AV_PIX_FMT_YUV444P  : 1,
+    AV_PIX_FMT_RGB24    : 3,
+    AV_PIX_FMT_0RGB     : 4,
+    AV_PIX_FMT_BGR0     : 4,
+    AV_PIX_FMT_ARGB     : 4,
+    AV_PIX_FMT_BGRA     : 4,
+    AV_PIX_FMT_GBRP     : 1,
+    }
+
+COLORSPACES = FORMAT_TO_ENUM.keys()
 ENUM_TO_FORMAT = {}
-def init_colorspaces():
-    global COLORSPACES
-    if COLORSPACES is not None:
-        #done already!
-        return
-    #populate mappings:
-    COLORSPACES = []
-    for pix_fmt, av_enum_str in {
-            "YUV420P"   : "AV_PIX_FMT_YUV420P",
-            "YUV422P"   : "AV_PIX_FMT_YUV422P",
-            "YUV444P"   : "AV_PIX_FMT_YUV444P",
-            "RGB"       : "AV_PIX_FMT_RGB24",
-            "XRGB"      : "AV_PIX_FMT_0RGB",
-            "BGRX"      : "AV_PIX_FMT_BGR0",
-            "ARGB"      : "AV_PIX_FMT_ARGB",
-            "BGRA"      : "AV_PIX_FMT_BGRA",
-            "GBRP"      : "AV_PIX_FMT_GBRP",
-         }.items():
-        av_enum = constants.get(av_enum_str)
-        if av_enum is None:
-            debug("colorspace format %s (%s) not supported by avcodec", pix_fmt, av_enum_str)
-            continue
-        FORMAT_TO_ENUM[pix_fmt] = av_enum
-        ENUM_TO_FORMAT[av_enum] = pix_fmt
-        COLORSPACES.append(pix_fmt)
-    debug("colorspaces supported by avcodec %s: %s", get_version(), COLORSPACES)
-    if len(COLORSPACES)==0:
-        error("avcodec installation problem: no colorspaces found!")
-
-def get_colorspaces():
-    init_colorspaces()
-    return COLORSPACES
-
-CODECS = None
-def get_encodings():
-    global CODECS
-    if CODECS is None:
-        avcodec_register_all()
-        CODECS = []
-        if avcodec_find_decoder(CODEC_ID_H264)!=NULL:
-            CODECS.append("h264")
-        if avcodec_find_decoder(CODEC_ID_VP8)!=NULL:
-            CODECS.append("vp8")
-        #if avcodec_find_decoder(CODEC_ID_VP9)!=NULL:
-        #    CODECS.append("vp9")
-    return CODECS
-
+for pix_fmt, av_enum in FORMAT_TO_ENUM.items():
+    ENUM_TO_FORMAT[av_enum] = pix_fmt
 
 def get_version():
     return (LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR, LIBAVCODEC_VERSION_MICRO)
+
+avcodec_register_all()
+CODECS = []
+if avcodec_find_decoder(AV_CODEC_ID_H264)!=NULL:
+    CODECS.append("h264")
+if avcodec_find_decoder(AV_CODEC_ID_VP8)!=NULL:
+    CODECS.append("vp8")
+if avcodec_find_decoder(AV_CODEC_ID_H265)!=NULL:
+    CODECS.append("h265")
+if avcodec_find_decoder(AV_CODEC_ID_MPEG4)!=NULL:
+    CODECS.append("mpeg4")
+if avcodec_find_decoder(AV_CODEC_ID_VP9)!=NULL:
+    VP9_CS = []
+    #there used to be problems with YUV444P with older versions of ffmpeg:
+    # "[vp9 @ ...] Invalid compressed header size"
+    #this version definitely works (older versions may work too - untested):
+    v = get_version()
+    if v<(56, 26, 100):         #2.6.3
+        log.warn("Warning: libavcodec version %s is too old:", ".".join((str(x) for x in v)))
+        log.warn(" disabling VP9")
+    else:
+        VP9_CS = ["YUV420P"]
+        if v<(56, 41, 100):     #2.7.1
+            log.warn("Warning: libavcodec version %s is too old:", ".".join((str(x) for x in v)))
+            log.warn(" disabling YUV444P support with VP9")
+        else:
+            VP9_CS.append("YUV444P")
+    CODECS.append("vp9")
+log("avcodec2.init_module: CODECS=%s", CODECS)
+
+
+def init_module():
+    log("dec_avcodec2.init_module()")
+    override_logger()
+
+def cleanup_module():
+    log("dec_avcodec2.cleanup_module()")
+    restore_logger()
 
 def get_type():
     return "avcodec2"
 
 def get_info():
+    f = {}
+    for e in get_encodings():
+        f["formats.%s" % e] = get_input_colorspaces(e)
     return  {"version"      : get_version(),
              "encodings"    : get_encodings(),
-             "formats"      : get_colorspaces(),
+             "formats"      : f,
              }
+
+def get_encodings():
+    global CODECS
+    return CODECS
+
+def get_input_colorspaces(encoding):
+    if encoding not in CODECS:
+        return []
+    if encoding in ("h264", "h265"):
+        return COLORSPACES
+    elif encoding in ("vp8", "mpeg4"):
+        return ["YUV420P"]
+    assert encoding=="vp9"
+    return VP9_CS
+
+def get_output_colorspace(encoding, csc):
+    if encoding not in CODECS:
+        return ""
+    if encoding=="h264" and csc in ("RGB", "XRGB", "BGRX", "ARGB", "BGRA"):
+        #h264 from plain RGB data is returned as "GBRP"!
+        return "GBRP"
+    elif encoding in ("vp8", "mpeg4"):
+        return "YUV420P"
+    #everything else as normal:
+    return csc
 
 
 cdef void clear_frame(AVFrame *frame):
     assert frame!=NULL, "frame is not set!"
-    for i in xrange(4):
+    for i in range(4):
         frame.data[i] = NULL
-
 
 cdef class AVFrameWrapper:
     """
@@ -189,24 +225,24 @@ cdef class AVFrameWrapper:
     cdef set_context(self, AVCodecContext *avctx, AVFrame *frame):
         self.avctx = avctx
         self.frame = frame
-        debug("%s.set_context(%s, %s)", self, hex(<unsigned long> avctx), hex(<unsigned long> frame))
+        log("%s.set_context(%#x, %#x)", self, <uintptr_t> avctx, <uintptr_t> frame)
 
     def __dealloc__(self):
         #By the time this wrapper is garbage collected,
         #we must have freed it!
         assert self.frame==NULL and self.avctx==NULL, "frame was freed by both, but not actually freed!"
 
-    def __str__(self):
+    def __repr__(self):
         if self.frame==NULL:
             return "AVFrameWrapper(NULL)"
-        return "AVFrameWrapper(%s)" % hex(<unsigned long> self.frame)
+        return "AVFrameWrapper(%#x)" % <uintptr_t> self.frame
 
     def xpra_free(self):
-        debug("%s.xpra_free()", self)
+        log("%s.xpra_free()", self)
         self.free()
 
     cdef free(self):
-        debug("%s.free() context=%s, frame=%s", self, hex(<unsigned long> self.avctx), hex(<unsigned long> self.frame))
+        log("%s.free() context=%#x, frame=%#x", self, <uintptr_t> self.avctx, <uintptr_t> self.frame)
         if self.avctx!=NULL and self.frame!=NULL:
             av_frame_unref(self.frame)
             self.frame = NULL
@@ -219,85 +255,95 @@ class AVImageWrapper(ImageWrapper):
         when the image is freed, or once we have made a copy of the pixels.
     """
 
-    def __str__(self):                          #@DuplicatedSignature
-        return ImageWrapper.__str__(self)+"-(%s)" % self.av_frame
+    def _cn(self):                          #@DuplicatedSignature
+        return "AVImageWrapper-%s" % self.av_frame
 
     def free(self):                             #@DuplicatedSignature
-        debug("AVImageWrapper.free()")
+        log("AVImageWrapper.free()")
         ImageWrapper.free(self)
         self.xpra_free_frame()
 
     def clone_pixel_data(self):
-        debug("AVImageWrapper.clone_pixel_data()")
+        log("AVImageWrapper.clone_pixel_data()")
         ImageWrapper.clone_pixel_data(self)
         self.xpra_free_frame()
 
     def xpra_free_frame(self):
-        debug("AVImageWrapper.xpra_free_frame() av_frame=%s", self.av_frame)
-        if self.av_frame:
-            self.av_frame.xpra_free()
+        av_frame = self.av_frame
+        log("AVImageWrapper.xpra_free_frame() av_frame=%s", av_frame)
+        if av_frame:
             self.av_frame = None
-
+            av_frame.xpra_free()
 
 
 cdef class Decoder:
     """
         This wraps the AVCodecContext and its configuration,
         also tracks AVFrames.
+        It also handles reconstructing a single ImageWrapper
+        constructed from 3-pass decoding (see plane_sizes).
     """
     cdef AVCodec *codec
     cdef AVCodecContext *codec_ctx
     cdef AVPixelFormat pix_fmt
     cdef AVPixelFormat actual_pix_fmt
-    cdef char *colorspace
-    cdef object framewrappers
+    cdef object colorspace
     cdef object weakref_images
-    cdef AVFrame *frame                             #@DuplicatedSignature
-    cdef int frames
+    cdef AVFrame *av_frame
+    #this is the actual number of images we have returned
+    cdef unsigned long frames
     cdef int width
     cdef int height
     cdef object encoding
 
+    cdef object __weakref__
+
     def init_context(self, encoding, int width, int height, colorspace):
         cdef int r
-        init_colorspaces()
-        assert encoding in ("vp8", "h264")
+        cdef int i
+        assert encoding in CODECS
         self.encoding = encoding
         self.width = width
         self.height = height
         assert colorspace in COLORSPACES, "invalid colorspace: %s" % colorspace
-        self.colorspace = NULL
+        self.colorspace = ""
         for x in COLORSPACES:
             if x==colorspace:
                 self.colorspace = x
                 break
-        if self.colorspace==NULL:
-            error("invalid pixel format: %s", colorspace)
+        if not self.colorspace:
+            log.error("invalid pixel format: %s", colorspace)
             return  False
-        self.pix_fmt = FORMAT_TO_ENUM.get(colorspace, PIX_FMT_NONE)
-        if self.pix_fmt==PIX_FMT_NONE:
-            error("invalid pixel format: %s", colorspace)
+        self.pix_fmt = FORMAT_TO_ENUM.get(colorspace, AV_PIX_FMT_NONE)
+        if self.pix_fmt==AV_PIX_FMT_NONE:
+            log.error("invalid pixel format: %s", colorspace)
             return  False
         self.actual_pix_fmt = self.pix_fmt
 
         avcodec_register_all()
 
+        cdef AVCodecID CodecID
         if self.encoding=="h264":
-            self.codec = avcodec_find_decoder(CODEC_ID_H264)
-            if self.codec==NULL:
-                error("codec H264 not found!")
-                return  False
+            CodecID = AV_CODEC_ID_H264
+        elif self.encoding=="h265":
+            CodecID = AV_CODEC_ID_H265
+        elif self.encoding=="vp8":
+            CodecID = AV_CODEC_ID_VP8
+        elif self.encoding=="vp9":
+            CodecID = AV_CODEC_ID_VP9
+        elif self.encoding=="mpeg4":
+            CodecID = AV_CODEC_ID_MPEG4
         else:
-            assert self.encoding=="vp8"
-            self.codec = avcodec_find_decoder(CODEC_ID_VP8)
-            if self.codec==NULL:
-                error("codec VP8 not found!")
-                return  False
+            raise Exception("invalid codec; %s" % self.encoding)
+        self.codec = avcodec_find_decoder(CodecID)
+        if self.codec==NULL:
+            log.error("codec %s not found!" % self.encoding)
+            return  False
 
         #from here on, we have to call clean_decoder():
         self.codec_ctx = avcodec_alloc_context3(self.codec)
         if self.codec_ctx==NULL:
-            error("failed to allocate codec context!")
+            log.error("failed to allocate codec context!")
             self.clean_decoder()
             return  False
 
@@ -313,30 +359,40 @@ cdef class Decoder:
         self.codec_ctx.flags2 |= CODEC_FLAG2_FAST   #may cause "no deblock across slices" - which should be fine
         r = avcodec_open2(self.codec_ctx, self.codec, NULL)
         if r<0:
-            error("could not open codec: %s", self.av_error_str(r))
+            log.error("could not open codec: %s", av_error_str(r))
             self.clean_decoder()
             return  False
-        self.frame = av_frame_alloc()
-        if self.frame==NULL:
-            error("could not allocate an AVFrame for decoding")
+        #up to 3 AVFrame objects used:
+        self.av_frame = av_frame_alloc()
+        if self.av_frame==NULL:
+            log.error("could not allocate an AVFrame for decoding")
             self.clean_decoder()
             return  False
         self.frames = 0
-        #to keep track of frame wrappers:
-        self.framewrappers = {}
         #to keep track of images not freed yet:
         #(we want a weakref.WeakSet() but this is python2.7+ only..)
         self.weakref_images = []
         #register this decoder in the global dictionary:
-        debug("dec_avcodec.Decoder.init_context(%s, %s, %s) self=%s", width, height, colorspace, self.get_info())
+        log("dec_avcodec.Decoder.init_context(%s, %s, %s) self=%s", width, height, colorspace, self.get_info())
         return True
 
     def clean(self):
         self.clean_decoder()
+        self.codec = NULL
+        self.pix_fmt = 0
+        self.actual_pix_fmt = 0
+        self.colorspace = ""
+        self.weakref_images = []
+        self.av_frame = NULL                        #should be redundant
+        self.frames = 0
+        self.width = 0
+        self.height = 0
+        self.encoding = ""
+
 
     def clean_decoder(self):
-        cdef int r                      #@DuplicateSignature
-        debug("%s.clean_decoder()", self)
+        cdef int r, i
+        log("%s.clean_decoder()", self)
         #we may have images handed out, ensure we don't reference any memory
         #that needs to be freed using avcodec_release_buffer(..)
         #as this requires the context to still be valid!
@@ -344,44 +400,41 @@ cdef class Decoder:
         if self.weakref_images:
             images = [y for y in [x() for x in self.weakref_images] if y is not None]
             self.weakref_images = []
-            debug("clean_decoder() cloning pixels for images still in use: %s", images)
+            log("clean_decoder() cloning pixels for images still in use: %s", images)
             for img in images:
-                img.clone_pixel_data()
+                if not img.freed:
+                    img.clone_pixel_data()
 
-        debug("clean_decoder() freeing AVFrame: %s", hex(<unsigned long> self.frame))
-        if self.frame!=NULL:
-            av_frame_free(&self.frame)
+        if self.av_frame!=NULL:
+            log("clean_decoder() freeing AVFrame: %#x", <uintptr_t> self.av_frame)
+            av_frame_free(&self.av_frame)
             #redundant: self.frame = NULL
 
         cdef unsigned long ctx_key          #@DuplicatedSignature
-        debug("clean_decoder() freeing AVCodecContext: %s", hex(<unsigned long> self.codec_ctx))
+        log("clean_decoder() freeing AVCodecContext: %#x", <uintptr_t> self.codec_ctx)
         if self.codec_ctx!=NULL:
             r = avcodec_close(self.codec_ctx)
             if r!=0:
-                log.warn("error closing decoder context %s: %s", hex(<unsigned long> self.codec_ctx), self.av_error_str(r))
+                log.error("Error: failed to close decoder context %#x:", <uintptr_t> self.codec_ctx)
+                log.error(" %s", av_error_str(r))
             av_free(self.codec_ctx)
             self.codec_ctx = NULL
-        debug("clean_decoder() done")
+        log("clean_decoder() done")
 
-    cdef av_error_str(self, errnum):
-        cdef char[128] err_str
-        if av_strerror(errnum, err_str, 128)==0:
-            return str(err_str[:128])
-        return str(errnum)
-
-    def __str__(self):                      #@DuplicatedSignature
+    def __repr__(self):                      #@DuplicatedSignature
+        if self.is_closed():
+            return "dec_avcodec.Decoder(*closed*)"
         return "dec_avcodec.Decoder(%s)" % self.get_info()
 
     def get_info(self):                      #@DuplicatedSignature
-        info = get_info()
-        info.update({
+        info = {"version"   : get_version(),
+                "encoding"  : self.encoding,
+                "formats"   : get_input_colorspaces(self.encoding),
                 "type"      : self.get_type(),
                 "frames"    : self.frames,
                 "width"     : self.width,
                 "height"    : self.height,
-                })
-        if self.framewrappers is not None:
-            info["buffers"] = len(self.framewrappers)
+                }
         if self.colorspace:
             info["colorspace"] = self.colorspace
             info["actual_colorspace"] = self.get_actual_colorspace()
@@ -405,108 +458,157 @@ cdef class Decoder:
         return self.height
 
     def get_encoding(self):
-        return "h264"
+        return self.encoding
 
     def get_type(self):                             #@DuplicatedSignature
         return "avcodec"
+
+    def log_av_error(self, int buf_len, err_no, options={}):
+        msg = av_error_str(err_no)
+        self.log_error(buf_len, msg, options, "error %i" % err_no)
+
+    def log_error(self, int buf_len, err, options={}, error_type="error"):
+        log.error("Error: avcodec %s decoding %i bytes of %s data:", error_type, buf_len, self.encoding)
+        log.error(" '%s'", err)
+        log.error(" frame %i", self.frames)
+        if options:
+            log.error(" frame options:")
+            for k,v in options.items():
+                log.error("   %s=%s", k, v)
+        log.error(" decoder state:")
+        for k,v in self.get_info().items():
+            log.error("   %s = %s", k, v)
 
     def decompress_image(self, input, options):
         cdef unsigned char * padded_buf = NULL
         cdef const unsigned char * buf = NULL
         cdef Py_ssize_t buf_len = 0
-        cdef int len = 0
-        cdef int got_picture
+        cdef int size
+        cdef int ret = 0
+        cdef int nplanes
         cdef AVPacket avpkt
         cdef unsigned long frame_key                #@DuplicatedSignature
         cdef AVFrameWrapper framewrapper
+        cdef AVFrame *av_frame
         cdef object img
-        assert self.codec_ctx!=NULL
+        assert self.codec_ctx!=NULL, "no codec context! (not initialized or already closed)"
         assert self.codec!=NULL
-        #copy input buffer into padded C buffer:
-        PyObject_AsReadBuffer(input, <const void**> &buf, &buf_len)
-        padded_buf = <unsigned char *> xmemalign(buf_len+128)
+
+        #copy the whole input buffer into a padded C buffer:
+        assert object_as_buffer(input, <const void**> &buf, &buf_len)==0
+        padded_buf = <unsigned char *> memalign(buf_len+128)
+        assert padded_buf!=NULL, "failed to allocate %i bytes of memory" % (buf_len+128)
         memcpy(padded_buf, buf, buf_len)
         memset(padded_buf+buf_len, 0, 128)
+
+        #note: plain RGB output, will redefine those:
+        out = []
+        strides = []
+        outsize = 0
+
         #ensure we can detect if the frame buffer got allocated:
-        clear_frame(self.frame)
+        clear_frame(self.av_frame)
         #now safe to run without gil:
         with nogil:
             av_init_packet(&avpkt)
-            avpkt.data = <uint8_t *> padded_buf
+            avpkt.data = <uint8_t *> (padded_buf)
             avpkt.size = buf_len
-            len = avcodec_decode_video2(self.codec_ctx, self.frame, &got_picture, &avpkt)
+            ret = avcodec_send_packet(self.codec_ctx, &avpkt)
+        if ret!=0:
             free(padded_buf)
-        if len < 0: #for testing add: or options.get("frame", 0)%100==99:
-            self.frame_error()
-            log.warn("%s.decompress_image(%s:%s, %s) avcodec_decode_video2 failure: %s", self, type(input), buf_len, options, self.av_error_str(len))
+            log("%s.decompress_image(%s:%s, %s) avcodec_send_packet failure: %s", self, type(input), buf_len, options, av_error_str(ret))
+            self.log_av_error(buf_len, ret, options)
             return None
-            #raise Exception("avcodec_decode_video2 failed to decode this frame and returned %s, decoder=%s" % (len, self.get_info()))
+        with nogil:
+            ret = avcodec_receive_frame(self.codec_ctx, self.av_frame)
+        free(padded_buf)
+        if ret==-errno.EAGAIN:
+            d = options.get("delayed", 0)
+            if d>0:
+                log("avcodec_decode_video2 %i delayed pictures", d)
+                return None
+            self.log_error(buf_len, "no picture", options)
+            return None
+        if ret!=0:
+            av_frame_unref(self.av_frame)
+            log("%s.decompress_image(%s:%s, %s) avcodec_decode_video2 failure: %s", self, type(input), buf_len, options, av_error_str(ret))
+            self.log_av_error(buf_len, ret, options)
+            return None
 
-        if self.actual_pix_fmt!=self.frame.format:
-            self.actual_pix_fmt = self.frame.format
+        log("avcodec_decode_video2 returned %i", ret)
+        if self.actual_pix_fmt!=self.av_frame.format:
+            if self.av_frame.format==-1:
+                self.log_error(buf_len, "unknown format returned")
+                return None
+            self.actual_pix_fmt = self.av_frame.format
             if self.actual_pix_fmt not in ENUM_TO_FORMAT:
-                self.frame_error()
-                raise Exception("unknown output pixel format: %s, expected %s (%s)" % (self.actual_pix_fmt, self.pix_fmt, self.colorspace))
-            debug("avcodec actual output pixel format is %s (%s), expected %s (%s)", self.actual_pix_fmt, self.get_actual_colorspace(), self.pix_fmt, self.colorspace)
+                av_frame_unref(self.av_frame)
+                log.error("unknown output pixel format: %s, expected %s (%s)", self.actual_pix_fmt, self.pix_fmt, self.colorspace)
+                return None
+            log("avcodec actual output pixel format is %s (%s), expected %s (%s)", self.actual_pix_fmt, self.get_actual_colorspace(), self.pix_fmt, self.colorspace)
 
-        #print("decompress image: colorspace=%s / %s" % (self.colorspace, self.get_colorspace()))
         cs = self.get_actual_colorspace()
         if cs.endswith("P"):
-            out = []
-            strides = []
-            outsize = 0
             divs = get_subsampling_divs(cs)
             nplanes = 3
-            for i in range(nplanes):
+            for i in range(3):
                 _, dy = divs[i]
                 if dy==1:
                     height = self.codec_ctx.height
                 elif dy==2:
                     height = (self.codec_ctx.height+1)>>1
                 else:
-                    self.frame_error()
+                    av_frame_unref(self.av_frame)
                     raise Exception("invalid height divisor %s" % dy)
-                stride = self.frame.linesize[i]
+                stride = self.av_frame.linesize[i]
                 size = height * stride
                 outsize += size
-                if READ_ONLY:
-                    plane = PyBuffer_FromMemory(<void *>self.frame.data[i], size)
-                else:
-                    plane = PyBuffer_FromReadWriteMemory(<void *>self.frame.data[i], size)
-                out.append(plane)
+
+                out.append(memory_as_pybuffer(<void *>self.av_frame.data[i], size, True))
                 strides.append(stride)
+                log("decompress_image() read back yuv plane %s: %s bytes", i, size)
         else:
-            strides = self.frame.linesize[0]+self.frame.linesize[1]+self.frame.linesize[2]
+            #RGB mode: "out" is a single buffer
+            strides = self.av_frame.linesize[0]+self.av_frame.linesize[1]+self.av_frame.linesize[2]
             outsize = self.codec_ctx.height * strides
-            if READ_ONLY:
-                out = PyBuffer_FromMemory(<void *>self.frame.data[0], outsize)
-            else:
-                out = PyBuffer_FromReadWriteMemory(<void *>self.frame.data[0], outsize)
+            out = memory_as_pybuffer(<void *>self.av_frame.data[0], outsize, True)
             nplanes = 0
+            log("decompress_image() read back rgb buffer: %s bytes", outsize)
+
         if outsize==0:
-            self.frame_error()
+            av_frame_unref(self.av_frame)
             raise Exception("output size is zero!")
-        assert self.codec_ctx.width>=self.width, "codec width is smaller than our width: %s<%s" % (self.codec_ctx.width, self.width)
-        assert self.codec_ctx.height>=self.height, "codec height is smaller than our height: %s<%s" % (self.codec_ctx.height, self.height)
-        img = AVImageWrapper(0, 0, self.width, self.height, out, cs, 24, strides, nplanes)
-        img.av_frame = None
+        if self.codec_ctx.width<self.width or self.codec_ctx.height<self.height:
+            raise Exception("%s context dimension %ix%i is smaller than the codec's expected size of %ix%i for frame %i" % (self.encoding, self.codec_ctx.width, self.codec_ctx.height, self.width, self.height, self.frames+1))
+
+        bpp = BYTES_PER_PIXEL.get(self.actual_pix_fmt, 0)
         framewrapper = AVFrameWrapper()
-        framewrapper.set_context(self.codec_ctx, self.frame)
+        framewrapper.set_context(self.codec_ctx, self.av_frame)
+        img = AVImageWrapper(0, 0, self.width, self.height, out, cs, 24, strides, bpp, nplanes, thread_safe=False)
         img.av_frame = framewrapper
         self.frames += 1
         #add to weakref list after cleaning it up:
         self.weakref_images = [x for x in self.weakref_images if x() is not None]
-        ref = weakref.ref(img)
-        self.weakref_images.append(ref)
-        debug("%s.decompress_image(%s:%s, %s)=%s", self, type(input), buf_len, options, img)
+        self.weakref_images.append(weakref.ref(img))
+        log("%s:", self)
+        log("decompress_image(%s:%s, %s)=%s", type(input), buf_len, options, img)
         return img
 
-
-    cdef AVFrameWrapper frame_error(self):
-        av_frame_unref(self.frame)
 
     def get_colorspace(self):
         return self.colorspace
 
     def get_actual_colorspace(self):
         return ENUM_TO_FORMAT.get(self.actual_pix_fmt, "unknown/invalid")
+
+
+def selftest(full=False):
+    global CODECS
+    from xpra.codecs.codec_checks import testdecoder
+    from xpra.codecs.dec_avcodec2 import decoder
+    global CODECS
+    try:
+        suspend_nonfatal_logging()
+        CODECS = testdecoder(decoder, full)
+    finally:
+        resume_nonfatal_logging()

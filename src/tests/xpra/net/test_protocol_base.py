@@ -6,17 +6,16 @@
 
 import socket
 import os
-import logging
-logging.basicConfig(format="%(asctime)s %(message)s")
-logging.root.setLevel(logging.DEBUG)
 
 from xpra.net.protocol import Protocol
 from xpra.net.bytestreams import SocketConnection
 from xpra.log import Logger
 log = Logger()
+log.enable_debug()
 
 import gobject
 gobject.threads_init()
+import glib
 
 TEST_SOCKFILE = "./test-socket"
 
@@ -26,7 +25,9 @@ def makeSocketConnection(sock, name):
         peername = sock.getpeername()
     except:
         peername = str(sock)
-    return SocketConnection(sock, sock.getsockname(), peername, "test-client-socket")
+    sockname = sock.getsockname()
+    target = peername or sockname
+    return SocketConnection(sock, sockname, peername, target, "test-client-socket")
 
 
 class SimpleServer(object):
@@ -54,7 +55,7 @@ class SimpleServer(object):
         sock.settimeout(None)
         sock.setblocking(1)
         sc = makeSocketConnection(sock, str(address)+"server")
-        protocol = Protocol(gobject, sc, self.process_packet)
+        protocol = Protocol(glib, sc, self.process_packet)
         protocol.salt = None
         protocol.set_compression_level(1)
         protocol.start()
@@ -75,7 +76,7 @@ class SimpleClient(object):
         sock.connect(TEST_SOCKFILE)
         sock.settimeout(None)
         sc = makeSocketConnection(sock, "test-client-socket")
-        self.protocol = Protocol(gobject, sc, self.process_packet, None)
+        self.protocol = Protocol(glib, sc, self.process_packet, None)
         self.protocol.start()
         if len(self.packets)>0:
             gobject.timeout_add(1000, self.send_packet)
@@ -91,11 +92,3 @@ class SimpleClient(object):
     def get_packet(self, *args):
         log.info("get_packet(%s)", args)
         return None
-
-
-def init_main(prgname):
-    logging.basicConfig(format="%(asctime)s %(message)s")
-    logging.root.setLevel(logging.DEBUG)
-    from xpra.os_util import set_application_name, set_prgname
-    set_prgname(prgname)
-    set_application_name(prgname)

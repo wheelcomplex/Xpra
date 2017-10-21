@@ -1,21 +1,18 @@
 # This file is part of Xpra.
-# Copyright (C) 2014 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2014-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
-import time
-
-from xpra.log import Logger, debug_if_env
-log = Logger()
-debug = debug_if_env(log, "XPRA_PROXYVIDEO_DEBUG")
-error = log.error
+from xpra.log import Logger
+log = Logger("encoder", "proxy")
 
 from xpra.codecs.image_wrapper import ImageWrapper
-from xpra.deque import maxdeque
+from xpra.os_util import memoryview_to_bytes, monotonic_time
+from collections import deque
 
 
 def get_version():
-    return (0, 1)
+    return (0, 2)
 
 def get_type():
     return "proxy"
@@ -27,8 +24,10 @@ def get_encodings():
     return ["proxy"]
 
 def init_module():
-    #nothing to do!
-    pass
+    log("enc_proxy.init_module()")
+
+def cleanup_module():
+    log("enc_proxy.cleanup_module()")
 
 
 class Encoder(object):
@@ -37,7 +36,7 @@ class Encoder(object):
         the raw pixels and the metadata that goes with it.
     """
 
-    def init_context(self, width, height, src_format, encoding, quality, speed, scaling, options):
+    def init_context(self, width, height, src_format, dst_formats, encoding, quality, speed, scaling, options):
         self.encoding = encoding
         self.width = width
         self.height = height
@@ -45,9 +44,11 @@ class Encoder(object):
         self.speed = speed
         self.scaling = scaling
         self.src_format = src_format
-        self.last_frame_times = maxdeque(200)
+        self.dst_formats = dst_formats
+        self.last_frame_times = deque(maxlen=200)
         self.frames = 0
         self.time = 0
+        self.first_frame_timestamp = 0
 
     def get_info(self):             #@DuplicatedSignature
         info = get_info()
@@ -60,11 +61,12 @@ class Encoder(object):
                      "quality"   : self.quality,
                      "encoding"  : self.encoding,
                      "src_format": self.src_format,
+                     "dst_formats" : self.dst_formats,
                      "version"   : get_version()})
         if self.scaling!=(1,1):
             info["scaling"] = self.scaling
         #calculate fps:
-        now = time.time()
+        now = monotonic_time()
         last_time = now
         cut_off = now-10.0
         f = 0
@@ -73,10 +75,10 @@ class Encoder(object):
                 f += 1
                 last_time = min(last_time, v)
         if f>0 and last_time<now:
-            info["fps"] = int(f/(now-last_time))
+            info["fps"] = int(0.5+f/(now-last_time))
         return info
 
-    def __str__(self):
+    def __repr__(self):
         if self.src_format is None:
             return "proxy_encoder(uninitialized)"
         return "proxy_encoder(%s - %sx%s)" % (self.src_format, self.width, self.height)
@@ -94,7 +96,7 @@ class Encoder(object):
         return self.height
 
     def get_type(self):                     #@DuplicatedSignature
-        return  "proxy"
+        return "proxy"
 
     def get_src_format(self):
         return self.src_format
@@ -105,39 +107,48 @@ class Encoder(object):
         self.quality = 0
         self.speed = 0
         self.src_format = None
+        self.encoding = ""
+        self.scaling = None
+        self.src_format = ""
+        self.dst_formats = []
+        self.last_frame_times = []
+        self.frames = 0
+        self.time = 0
+        self.first_frame_timestamp = 0
 
-    def get_client_options(self, image, options):
-        options = {
+    def compress_image(self, image, quality=-1, speed=-1, options={}):
+        log("compress_image(%s, %s)", image, options)
+        #pass the pixels as they are
+        assert image.get_planes()==ImageWrapper.PACKED, "invalid number of planes: %s" % image.get_planes()
+        self.quality = quality
+        self.speed = speed
+        pixels = image.get_pixels()
+        assert pixels, "failed to get pixels from %s" % image
+        #info used by proxy encoder:
+        client_options = {
                 "proxy"     : True,
                 "frame"     : self.frames,
+                "pts"       : image.get_timestamp()-self.first_frame_timestamp,
                 #pass-through encoder options:
                 "options"   : options,
                 #redundant metadata:
                 #"width"     : image.get_width(),
                 #"height"    : image.get_height(),
-                "quality"   : options.get("quality", self.quality),
-                "speed"     : options.get("speed", self.speed),
+                "quality"   : quality,
+                "speed"     : speed,
+                "timestamp" : image.get_timestamp(),
                 "rowstride" : image.get_rowstride(),
                 "depth"     : image.get_depth(),
                 "rgb_format": image.get_pixel_format(),
                 }
+        if self.frames==0:
+            self.first_frame_timestamp = image.get_timestamp()
+            #must pass dst_formats so the proxy can instantiate the video encoder
+            #with the correct CSC config:
+            client_options["dst_formats"] = self.dst_formats
         if self.scaling!=(1,1):
-            options["scaling"] = self.scaling
-        return options
-
-    def compress_image(self, image, options={}):
-        debug("compress_image(%s, %s)", image, options)
-        #pass the pixels as they are
-        assert image.get_planes()==ImageWrapper.PACKED, "invalid number of planes: %s" % image.get_planes()
-        pixels = str(image.get_pixels())
+            client_options["scaling"] = self.scaling
+        log("compress_image(%s, %s) returning %s bytes and options=%s", image, options, len(pixels), client_options)
+        self.last_frame_times.append(monotonic_time())
         self.frames += 1
-        self.last_frame_times.append(time.time())
-        client_options = self.get_client_options(image, options)
-        debug("compress_image(%s, %s) returning %s bytes and options=%s", image, options, len(pixels), client_options)
-        return  pixels, client_options
-
-    def set_encoding_speed(self, pct):
-        self.speed = int(min(100, max(0, pct)))
-
-    def set_encoding_quality(self, pct):
-        self.quality = int(min(100, max(0, pct)))
+        return  memoryview_to_bytes(pixels[:]), client_options

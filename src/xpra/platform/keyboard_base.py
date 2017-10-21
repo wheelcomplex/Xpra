@@ -1,13 +1,12 @@
 # This file is part of Xpra.
 # Copyright (C) 2010 Nathaniel Smith <njs@pobox.com>
-# Copyright (C) 2011-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2011-2014 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
 from xpra.keyboard.mask import mask_to_names, MODIFIER_MAP
-from xpra.log import Logger, debug_if_env
-log = Logger()
-debug = debug_if_env(log, "XPRA_KEYBOARD_DEBUG")
+from xpra.log import Logger
+log = Logger("keyboard")
 
 
 class KeyboardBase(object):
@@ -28,7 +27,7 @@ class KeyboardBase(object):
         return False
 
     def set_modifier_mappings(self, mappings):
-        debug("set_modifier_mappings(%s)", mappings)
+        log("set_modifier_mappings(%s)", mappings)
         self.modifier_mappings = mappings
         self.modifier_keys = {}
         self.modifier_keycodes = {}
@@ -38,27 +37,27 @@ class KeyboardBase(object):
                 keycodes = self.modifier_keycodes.setdefault(keyname, [])
                 if keycode not in keycodes:
                     keycodes.append(keycode)
-        debug("modifier_keys=%s", self.modifier_keys)
-        debug("modifier_keycodes=%s", self.modifier_keycodes)
+        log("modifier_keys=%s", self.modifier_keys)
+        log("modifier_keycodes=%s", self.modifier_keycodes)
 
     def mask_to_names(self, mask):
         return mask_to_names(mask, self.modifier_map)
 
     def get_keymap_modifiers(self):
         """
-            ask the server to manage numlock, and lock can be missing from mouse events
+            ask the server to manage capslock ('lock') which can be missing from mouse events
             (or maybe this is virtualbox causing it?)
         """
         return  {}, [], ["lock"]
 
     def get_keymap_spec(self):
-        return "", ""
+        return "", "", {}
 
     def get_x11_keymap(self):
         return {}
 
     def get_layout_spec(self):
-        return "", "", []
+        return "", [], "", None
 
     def get_keyboard_repeat(self):
         return None

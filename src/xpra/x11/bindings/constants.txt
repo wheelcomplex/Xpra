@@ -16,6 +16,7 @@ PointerWindow
 InputFocus
 PointerRoot
 CurrentTime
+AnyPropertyType
 
 # Map states
 IsUnmapped
@@ -167,6 +168,8 @@ RevertToNone
 NotifyNormal
 NotifyGrab
 NotifyUngrab
+NotifyWhileGrabbed
+
 # Focus events: details
 NotifyAncestor
 NotifyVirtual

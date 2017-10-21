@@ -12,37 +12,55 @@
 __version__ = ("Python", 0, 11)
 
 import sys
-if sys.version > '3':
+if sys.version_info[0] >= 3:
     long = int              #@ReservedAssignment
-
-unicode_support = False
-def set_unicode_support(us):
-    global unicode_support
-    unicode_support = us
+    #idiotic py3k unicode mess makes us reinvent the wheel again:
+    def strindex(s, c, start):
+        i = start
+        while s[i] != ord(c):
+            i += 1
+            if i>=len(s):
+                return -1
+        return i
+    #the values end up being ints..
+    def cv(x):
+        return ord(x)
+    import codecs
+    def b(x):
+        if type(x)==bytes:
+            return x
+        return codecs.latin_1_encode(x)[0]
+else:
+    def strindex(s, c, start):
+        return s.index(c, start)
+    def cv(x):
+        return x
+    def b(x):               #@DuplicatedSignature
+        return x
 
 
 def decode_int(x, f):
     f += 1
-    newf = x.index('e', f)
+    newf = strindex(x, 'e', f)
     try:
         n = int(x[f:newf])
     except (OverflowError, ValueError):
         n = long(x[f:newf])
-    if x[f] == '-':
-        if x[f + 1] == '0':
+    if x[f] == cv('-'):
+        if x[f + 1] == cv('0'):
             raise ValueError
-    elif x[f] == '0' and newf != f+1:
+    elif x[f] == cv('0') and newf != f+1:
         raise ValueError
     return (n, newf+1)
 
 def decode_string(x, f):
-    colon = x.index(':', f)
+    colon = strindex(x, ':', f)
     assert colon>=0
     try:
         n = int(x[f:colon])
     except (OverflowError, ValueError):
         n = long(x[f:colon])
-    if x[f] == '0' and colon != f+1:
+    if x[f] == cv('0') and colon != f+1:
         raise ValueError
     colon += 1
     return (x[colon:colon+n], colon+n)
@@ -53,7 +71,7 @@ def decode_unicode(x, f):
 
 def decode_list(x, f):
     r, f = [], f+1
-    while x[f] != 'e':
+    while x[f] != cv('e'):
         fn = decode_func.get(x[f])
         if not fn:
             raise ValueError("invalid list entry: %s" % (x[f:]))
@@ -64,19 +82,17 @@ def decode_list(x, f):
 def decode_dict(x, f):
     r, f = {}, f+1
     #lastkey = None
-    while x[f] != 'e':
+    while x[f] != cv('e'):
         fn = decode_func.get(x[f])
         if not fn:
             raise ValueError("invalid dict key: %s" % (x[f:]))
         k, f = fn(x, f)
-        #if lastkey is not None and lastkey >= k:
-        #    raise ValueError("keys are not in ascending order!")
-        #lastkey = k
         fn = decode_func.get(x[f])
         if not fn:
             raise ValueError("invalid dict value: %s" % (x[f:]))
         r[k], f = fn(x, f)
     return (r, f + 1)
+
 
 decode_func = {}
 decode_func['l'] = decode_list
@@ -87,14 +103,16 @@ for c in '0123456789':
 decode_func['u'] = decode_unicode
 #now as byte values:
 for k,v in dict(decode_func).items():
-    decode_func[ord(k)] = lambda x,f : v(str(x), f)
+    decode_func[ord(k)] = v
+
 
 def bdecode(x):
     try:
-        fn = decode_func.get(x[0])
+        xs = b(x)
+        fn = decode_func.get(xs[0])
         if not fn:
-            raise ValueError("invalid type identifier: %s" % (x[0]))
-        r, l = fn(x, 0)
+            raise ValueError("invalid type identifier: %s" % (xs[0]))
+        r, l = fn(xs, 0)
     except (IndexError, KeyError):
         import traceback
         traceback.print_exc()
@@ -109,12 +127,8 @@ def encode_string(x, r):
     r.extend((str(len(x)), ':', x))
 
 def encode_unicode(x, r):
-    global unicode_support
     x = x.encode("utf8")
-    if unicode_support:
-        r.extend(('u', str(len(x)), ':', x))
-    else:
-        encode_string(x, r)
+    encode_string(x, r)
 
 def encode_list(x, r):
     r.append('l')
@@ -132,7 +146,7 @@ def encode_dict(x,r):
 
 
 encode_func = {}
-if sys.version < '3':
+if sys.version_info[0] < 3:
     from types import (StringType, UnicodeType, IntType, LongType, DictType, ListType,
                        TupleType, BooleanType)
     encode_func[IntType] = encode_int
@@ -150,11 +164,9 @@ else:
     encode_func[tuple] = encode_list
     encode_func[dict] = encode_dict
     encode_func[bool] = encode_int
-    def encode_bytes(x, r):
-        encode_string(x.decode(), r)
-    encode_func[bytes] = encode_bytes
+    encode_func[bytes] = encode_string
 
 def bencode(x):
     r = []
     encode_func[type(x)](x, r)
-    return ''.join(r)
+    return b''.join(b(v) for v in r)

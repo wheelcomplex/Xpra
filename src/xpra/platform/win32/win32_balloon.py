@@ -7,13 +7,12 @@
 # Support for "balloon" notifications on MS Windows
 # Based on code from winswitch, itself based on "win32gui_taskbar demo"
 
-
-# Try and use XP features, so we get alpha-blending etc.
-try:
-    from winxpgui import NIF_INFO, NIIF_INFO, NIM_MODIFY
-except ImportError:
-    from win32gui import NIF_INFO, NIIF_INFO, NIM_MODIFY
 import struct
+from ctypes import windll
+
+NIF_INFO = 16
+NIIF_INFO = 1
+NIM_MODIFY = 1
 
 
 def visible_command(command, max_len=100, no_nl=True):
@@ -98,11 +97,9 @@ def notify(hwnd, title, message, timeout=5000):
     if timeout<=0:
         timeout = 5000
     nid.uTimeoutOrVersion = timeout
-    #import win32con
     #WM_TRAYICON = win32con.WM_USER + 20
     #nid.uCallbackMessage = WM_TRAYICON
     # Call the Windows function, not the wrapped one
-    from ctypes import windll
     Shell_NotifyIcon = windll.shell32.Shell_NotifyIconA
     Shell_NotifyIcon(NIM_MODIFY, nid.pack())
 

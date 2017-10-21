@@ -5,7 +5,8 @@
 # later version. See the file COPYING for details.
 
 
-from tests.xpra.net.test_protocol_base import SimpleServer, init_main
+from xpra.platform import init
+from tests.xpra.net.test_protocol_base import SimpleServer
 import gobject
 import os.path
 import socket
@@ -14,11 +15,9 @@ GTK = True
 PLATFORM_INIT = True
 if PLATFORM_INIT:
     from xpra.platform.features import LOCAL_SERVERS_SUPPORTED, SHADOW_SUPPORTED
-    from xpra.platform.options import add_client_options
-    from xpra.platform.paths import get_default_socket_dir
     from xpra.platform import init as platform_init
     platform_init()
-    nones = [x for x in (LOCAL_SERVERS_SUPPORTED, SHADOW_SUPPORTED, add_client_options, get_default_socket_dir) if x is None]
+    nones = [x for x in (LOCAL_SERVERS_SUPPORTED, SHADOW_SUPPORTED) if x is None]
     assert len([])==0
 
 PLATFORM_GUI_INIT = PLATFORM_INIT and True
@@ -32,7 +31,7 @@ if PLATFORM_GUI_INIT:
 
 
 def main():
-    init_main("Shadow Protocol Test Tool")
+    init("Fake-Server-Test", "Xpra Fake Server Test Tool")
     if GTK:
         import gtk
         loop_exit = gtk.main_quit

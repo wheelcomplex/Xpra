@@ -6,12 +6,11 @@
 
 import sys
 import socket
-import logging
 
 from xpra.log import Logger
 log = Logger()
 
-from xpra.dotxpra import DotXpra
+from xpra.platform.dotxpra import DotXpra
 from xpra.net.bytestreams import SocketConnection
 from xpra.scripts.config import make_defaults_struct
 
@@ -22,8 +21,7 @@ def test_DoS(client_class_constructor, args):
     """
 
     assert len(args)==2, "usage: test_DoS_client :DISPLAY"
-    logging.root.setLevel(logging.DEBUG)
-    logging.root.addHandler(logging.StreamHandler(sys.stderr))
+    log.enable_debug()
     opts = make_defaults_struct()
     opts.password_file = ""
     opts.encoding = "rgb24"
@@ -36,7 +34,7 @@ def test_DoS(client_class_constructor, args):
     print("will attempt to connect to socket: %s" % target)
     sock = socket.socket(socket.AF_UNIX)
     sock.connect(target)
-    conn = SocketConnection(sock, sock.getsockname(), sock.getpeername(), "test_DoS")
+    conn = SocketConnection(sock, sock.getsockname(), sock.getpeername(), target, "test_DoS")
     print("socket connection=%s" % conn)
     app = client_class_constructor(conn, opts)
     try:

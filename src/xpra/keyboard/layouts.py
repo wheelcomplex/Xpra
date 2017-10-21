@@ -90,7 +90,7 @@ WIN32_LAYOUTS = {
            2052: ("CHS", "PRC",            "Chinese, Simplified",      0,      "cn", ["tib", "tib_asciinum", "uig"]),
            2055: ("DES", "Switzerland",    "German",                   1252,   "de", ["deadacute", "deadgraveacute", "nodeadkeys", "ro", "ro_nodeadkeys", "dvorak", "sundeadkeys", "neo", "mac", "mac_nodeadkeys", "dsb", "dsb_qwertz", "qwerty", "ru"]),
            2057: ("ENG", "UK",             "English",                  1252,   "gb", ["extd", "intl", "dvorak", "dvorakukp", "mac", "mac_intl", "colemak"]),
-           2058: ("ESM", "Mexico",         "Spanish",                  1252,   "latam", LATAM_VARIANTS),
+           2058: ("ESM", "Mexico",         "Spanish",                  1252,   "es", ES_VARIANTS),
            2060: ("FRB", "Benelux",        "French",                   1252,   "be", ["oss", "oss_latin9", "oss_sundeadkeys", "iso-alternate", "nodeadkeys", "sundeadkeys", "wang"]),
            2064: ("ITS", "Switzerland",    "Italian",                  1252,   "it", ["nodeadkeys", "mac", "us", "geo"]),
            2067: ("NLB", "Belgium",        "Dutch",                    1252,   "nl", ["sundeadkeys", "mac", "std"]),
@@ -181,3 +181,25 @@ for _, _, _, _, layout, variants in WIN32_LAYOUTS.values():
     for v in variants:
         if v not in l:
             l.append(v)
+
+def parse_xkbmap_query(xkbmap_query):
+    """ parses the output of "setxkbmap -query" into a dict """
+    import re
+    settings = {}
+    opt_re = re.compile("(\w*):\s*(.*)")
+    for line in xkbmap_query.splitlines():
+        m = opt_re.match(line)
+        if m:
+            v = m.group(2).strip()
+            if v!=",":
+                settings[m.group(1)] = v
+    return settings
+
+def xkbmap_query_tostring(query_dict):
+    """ converts an xkb query dict back into a string """
+    s = ""
+    for k in ("rules", "model", "layout", "variant", "options"):
+        if k in query_dict:
+            v = query_dict.get(k)
+            s += (str(k)+":").ljust(12)+str(v)+"\n"
+    return s

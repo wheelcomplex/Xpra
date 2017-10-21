@@ -7,19 +7,21 @@
 import time
 import binascii
 from xpra.codecs.codec_constants import get_subsampling_divs
+from xpra.os_util import _buffer
 
 DEBUG = False
 
 MIN_SIZE = 1024*1024
 SOURCE_DATA = None
-def get_source_data(size):
+def get_source_data(size, seed=0):
     global SOURCE_DATA
-    if SOURCE_DATA is None or len(SOURCE_DATA)<size:
+    if SOURCE_DATA is None or len(SOURCE_DATA)+seed<size:
         print("creating sample data for size %s" % size)
-        SOURCE_DATA = bytearray(max(MIN_SIZE, size))
+        SOURCE_DATA = bytearray(max(MIN_SIZE, size+seed+1024))
         for i in range(size):
-            SOURCE_DATA[i] = (i)%256
-    return SOURCE_DATA[:size]
+            SOURCE_DATA[i] = i%256
+    return SOURCE_DATA[seed:size+seed]
+
 
 def dump_pixels(pixels):
     S = 64
@@ -30,7 +32,7 @@ def dump_pixels(pixels):
         add = ["..."]
     else:
         v = pixels
-    if t==buffer:
+    if t==_buffer:
         l = binascii.hexlify(v) + str(add)
     elif t==bytearray:
         l = binascii.hexlify(str(v)) + str(add)
@@ -50,7 +52,7 @@ def make_rgb_input(src_format, w, h, xratio=1, yratio=1, channelratio=64, use_st
     assert bpp==3 or bpp==4
     size = w*h*bpp
     if populate:
-        pixels = bytearray(get_source_data(size))
+        pixels = bytearray(get_source_data(size, seed))
     else:
         pixels = bytearray(size)
     end = time.time()
@@ -67,12 +69,12 @@ def make_planar_input(src_format, w, h, use_strings=False, populate=False, seed=
     Yxd, Yyd = Ydivs
     Uxd, Uyd = Udivs
     Vxd, Vyd = Vdivs
-    Ysize = w*h/Yxd/Yyd
-    Usize = w*h/Uxd/Uyd
-    Vsize = w*h/Vxd/Vyd
+    Ysize = w*h//Yxd//Yyd
+    Usize = w*h//Uxd//Uyd
+    Vsize = w*h//Vxd//Vyd
     def make_buffer(size):
         if populate:
-            return bytearray(get_source_data(size))
+            return bytearray(get_source_data(size, seed))
         else:
             return bytearray(size)
     Ydata = make_buffer(Ysize)
@@ -82,7 +84,7 @@ def make_planar_input(src_format, w, h, use_strings=False, populate=False, seed=
         pixels = (str(Ydata), str(Udata), str(Vdata))
     else:
         pixels = (Ydata, Udata, Vdata)
-    strides = (w/Yxd, w/Uxd, w/Vxd)
+    strides = (w//Yxd, w//Uxd, w//Vxd)
     end = time.time()
     if DEBUG:
         print("make_planar_input%s took %.1fms" % ((src_format, w, h, use_strings, populate), end-start))

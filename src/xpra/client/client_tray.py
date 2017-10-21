@@ -1,12 +1,11 @@
 # This file is part of Xpra.
-# Copyright (C) 2010-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2010-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
 from xpra.client.client_widget_base import ClientWidgetBase
-from xpra.log import Logger, debug_if_env
-log = Logger()
-debug = debug_if_env(log, "XPRA_TRAY_DEBUG")
+from xpra.log import Logger
+log = Logger("tray")
 
 from xpra.client.gtk_base.gtk_window_backing_base import GTKWindowBacking
 
@@ -22,11 +21,11 @@ class ClientTray(ClientWidgetBase):
     DEFAULT_GEOMETRY = DEFAULT_LOCATION + DEFAULT_SIZE
 
     def __init__(self, client, wid, w, h, tray_widget, mmap_enabled, mmap_area):
-        debug("ClientTray%s", (client, wid, w, h, tray_widget, mmap_enabled, mmap_area))
-        ClientWidgetBase.__init__(self, client, wid)
+        log("ClientTray%s", (client, wid, w, h, tray_widget, mmap_enabled, mmap_area))
+        ClientWidgetBase.__init__(self, client, wid, True)
         self.tray_widget = tray_widget
-        self._has_alpha = True
         self._geometry = None
+        self._window_alpha = True
         self.group_leader = None
 
         self.mmap_enabled = mmap_enabled
@@ -34,6 +33,9 @@ class ClientTray(ClientWidgetBase):
         self._backing = None
         self.new_backing(w, h)
         self.idle_add(self.reconfigure)
+
+    def get_backing_class(self):
+        return TrayBacking
 
     def is_OR(self):
         return True
@@ -48,20 +50,38 @@ class ClientTray(ClientWidgetBase):
         return self._geometry or ClientTray.DEFAULT_GEOMETRY
 
     def get_tray_geometry(self):
-        return self.tray_widget.get_geometry()
+        tw = self.tray_widget
+        if not tw:
+            return None
+        return tw.get_geometry()
 
     def get_tray_size(self):
-        return self.tray_widget.get_size()
+        tw = self.tray_widget
+        if not tw:
+            return None
+        return tw.get_size()
+
+
+    def freeze(self):
+        pass
+
+
+    def send_configure(self):
+        self.reconfigure(True)
 
     def reconfigure(self, force_send_configure=False):
-        geometry = self.tray_widget.get_geometry()
+        geometry = None
+        tw = self.tray_widget
+        if tw:
+            geometry = tw.get_geometry()
+        log("%s.reconfigure(%s) geometry=%s", self, force_send_configure, geometry)
         if geometry is None:
-            if self._geometry:
+            if self._geometry or not tw:
                 geometry = self._geometry
             else:
                 #make one up as best we can - maybe we have the size at least?
-                size = self.tray_widget.get_size()
-                debug("%s.reconfigure() guessing location using size=%s", self, size)
+                size = tw.get_size()
+                log("%s.reconfigure() guessing location using size=%s", self, size)
                 geometry = ClientTray.DEFAULT_LOCATION + list(size or ClientTray.DEFAULT_SIZE)
         x, y, w, h = geometry
         if w<=1 or h<=1:
@@ -69,19 +89,26 @@ class ClientTray(ClientWidgetBase):
             geometry = x, y, w, h
         if force_send_configure or self._geometry is None or geometry!=self._geometry:
             self._geometry = geometry
-            client_properties = {"encoding.transparency": True}
-            orientation = self.tray_widget.get_orientation()
-            if orientation:
-                client_properties["orientation"] = orientation
-            screen = self.tray_widget.get_screen()
-            if screen>=0:
-                client_properties["screen"] = screen
-            self._client.send("configure-window", self._id, x, y, w, h, client_properties)
+            client_properties = {
+                "encoding.transparency" : True,
+                "encodings.rgb_formats" : ["RGBA", "RGB", "RGBX"],
+                }
+            if tw:
+                orientation = tw.get_orientation()
+                if orientation:
+                    client_properties["orientation"] = orientation
+                screen = tw.get_screen()
+                if screen>=0:
+                    client_properties["screen"] = screen
+            #scale to server coordinates
+            sx, sy, sw, sh = self._client.crect(x, y, w, h)
+            log("%s.reconfigure(%s) sending configure for geometry=%s : %s", self, force_send_configure, geometry, (sx, sy, sw, sh, client_properties))
+            self._client.send("configure-window", self._id, sx, sy, sw, sh, client_properties)
         if self._size!=(w, h):
             self.new_backing(w, h)
 
     def move_resize(self, x, y, w, h):
-        debug("%s.move_resize(%s, %s, %s, %s)", self, x, y, w, h)
+        log("%s.move_resize(%s, %s, %s, %s)", self, x, y, w, h)
         w = max(1, w)
         h = max(1, h)
         self._geometry = x, y, w, h
@@ -89,12 +116,15 @@ class ClientTray(ClientWidgetBase):
 
     def new_backing(self, w, h):
         self._size = w, h
-        self._backing = TrayBacking(self._id, w, h, self._has_alpha)
+        data = None
+        if self._backing:
+            data = self._backing.data
+        self._backing = TrayBacking(self._id, w, h, self._has_alpha, data)
         if self.mmap_enabled:
             self._backing.enable_mmap(self.mmap)
 
     def update_metadata(self, metadata):
-        debug("%s.update_metadata(%s)", self, metadata)
+        log("%s.update_metadata(%s)", self, metadata)
 
     def update_icon(self, width, height, coding, data):
         #this is the window icon... not the tray icon!
@@ -102,33 +132,40 @@ class ClientTray(ClientWidgetBase):
 
 
     def draw_region(self, x, y, width, height, coding, img_data, rowstride, packet_sequence, options, callbacks):
-        assert coding in ("rgb24", "rgb32", "png", "mmap", "webp"), "invalid encoding for tray data: %s" % coding
-        debug("%s.draw_region%s", self, [x, y, width, height, coding, "%s bytes" % len(img_data), rowstride, packet_sequence, options, callbacks])
+        log("%s.draw_region%s", self, (x, y, width, height, coding, "%s bytes" % len(img_data), rowstride, packet_sequence, options, callbacks))
 
-        def after_draw_update_tray(success):
-            debug("%s.after_draw_update_tray(%s)", self, success)
+        #note: a new backing may be assigned between the time we call draw_region
+        # and the time we get the callback (as the draw may use idle_add)
+        backing = self._backing
+        def after_draw_update_tray(success, message=None):
+            log("%s.after_draw_update_tray(%s, %s)", self, success, message)
             if not success:
-                log.warn("after_draw_update_tray(%s) options=%s", success, options)
+                log.warn("after_draw_update_tray(%s, %s) options=%s", success, message, options)
                 return
-            if not self._backing.pixels:
-                log.warn("TrayBacking does not have any pixels / format!")
+            tray_data = backing.data
+            log("tray backing=%s, data: %s", backing, tray_data is not None)
+            if tray_data is None:
+                log.warn("Warning: no pixel data in tray backing for window %i", backing.wid)
                 return
-            self.set_tray_icon()
+            self.idle_add(self.set_tray_icon, tray_data)
             self.idle_add(self.reconfigure)
         callbacks.append(after_draw_update_tray)
-        self._backing.draw_region(x, y, width, height, coding, img_data, rowstride, options, callbacks)
+        backing.draw_region(x, y, width, height, coding, img_data, rowstride, options, callbacks)
 
-    def set_tray_icon(self):
-        debug("%s.set_tray_icon() format=%s", self, self._backing.format)
-        enc, w, h, rowstride = self._backing.format
+    def set_tray_icon(self, tray_data):
+        enc, w, h, rowstride, pixels, options = tray_data
+        log("%s.set_tray_icon(%s, %s, %s, %s, %s bytes)", self, enc, w, h, rowstride, len(pixels))
         has_alpha = enc=="rgb32"
-        self.tray_widget.set_icon_from_data(self._backing.pixels, has_alpha, w, h, rowstride)
+        tw = self.tray_widget
+        if tw:
+            tw.set_icon_from_data(pixels, has_alpha, w, h, rowstride, options)
 
 
     def destroy(self):
-        if self.tray_widget:
-            self.tray_widget.cleanup()
+        tw = self.tray_widget
+        if tw:
             self.tray_widget = None
+            tw.cleanup()
 
     def __repr__(self):
         return "ClientTray(%s)" % self._id
@@ -140,17 +177,30 @@ class TrayBacking(GTKWindowBacking):
         we can use them with the real widget.
     """
 
-    def __init__(self, wid, w, h, has_alpha):
-        self.pixels = None
-        self.format = None
-        GTKWindowBacking.__init__(self, wid)
+    #keep it simple: only accept 32-bit RGB(X),
+    #all tray implementations support alpha
+    RGB_MODES = ["RGBA", "RGBX"]
+    HAS_ALPHA = True
 
-    def _do_paint_rgb24(self, img_data, x, y, width, height, rowstride, options, callbacks):
-        self.pixels = img_data
-        self.format = ("rgb24", width, height, rowstride)
+    def __init__(self, wid, w, h, has_alpha, data=None):
+        self.data = data
+        GTKWindowBacking.__init__(self, wid, True)
+        self._backing = object()    #pretend we have a backing structure
+
+    def get_encoding_properties(self):
+        #override so we skip all csc caps:
+        return {
+            "encodings.rgb_formats" : self.RGB_MODES,
+            "encoding.transparency" : True,
+            }
+
+
+    def _do_paint_rgb24(self, img_data, x, y, width, height, rowstride, options):
+        log("TrayBacking(%i)._do_paint_rgb24%s", self.wid, ("%s bytes" % len(img_data), x, y, width, height, rowstride, options))
+        self.data = ["rgb24", width, height, rowstride, img_data[:], options]
         return True
 
-    def _do_paint_rgb32(self, img_data, x, y, width, height, rowstride, options, callbacks):
-        self.pixels = img_data
-        self.format = ("rgb32", width, height, rowstride)
+    def _do_paint_rgb32(self, img_data, x, y, width, height, rowstride, options):
+        log("TrayBacking(%i)._do_paint_rgb32%s", self.wid, ("%s bytes" % len(img_data), x, y, width, height, rowstride, options))
+        self.data = ["rgb32", width, height, rowstride, img_data[:], options]
         return True

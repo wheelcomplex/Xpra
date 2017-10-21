@@ -1,47 +1,51 @@
 #!/usr/bin/env python
 # This file is part of Xpra.
-# Copyright (C) 2011-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2011-2014 Antoine Martin <antoine@devloop.org.uk>
 
+from xpra.gtk_common.gobject_compat import import_gtk, import_gdk, is_gtk3, import_pango, import_glib
+from xpra.gtk_common.gtk_util import SHIFT_MASK, LOCK_MASK, CONTROL_MASK, MOD1_MASK, MOD2_MASK, MOD3_MASK, MOD4_MASK, MOD5_MASK
 import sys
-import pygtk
-pygtk.require('2.0')
-import gtk
-import pango
-import gobject
+from collections import deque
 
-from xpra.deque import maxdeque
+gtk = import_gtk()
+gdk = import_gdk()
+pango = import_pango()
+glib = import_glib()
+
 from xpra.platform.paths import get_icon
-from xpra.platform import init
+from xpra.gtk_common import gtk_util
+assert gtk_util, "cannot load compat class"
 
 
 modifier_names = {
-                  gtk.gdk.SHIFT_MASK        : "Shift",
-                  gtk.gdk.LOCK_MASK         : "Lock",
-                  gtk.gdk.CONTROL_MASK      : "Control",
-                  gtk.gdk.MOD1_MASK         : "mod1",
-                  gtk.gdk.MOD2_MASK         : "mod2",
-                  gtk.gdk.MOD3_MASK         : "mod3",
-                  gtk.gdk.MOD4_MASK         : "mod4",
-                  gtk.gdk.MOD5_MASK         : "mod5"
+                  SHIFT_MASK        : "Shift",
+                  LOCK_MASK         : "Lock",
+                  CONTROL_MASK      : "Control",
+                  MOD1_MASK         : "mod1",
+                  MOD2_MASK         : "mod2",
+                  MOD3_MASK         : "mod3",
+                  MOD4_MASK         : "mod4",
+                  MOD5_MASK         : "mod5"
                   }
 short_modifier_names = {
-                  gtk.gdk.SHIFT_MASK        : "S",
-                  gtk.gdk.LOCK_MASK         : "L",
-                  gtk.gdk.CONTROL_MASK      : "C",
-                  gtk.gdk.MOD1_MASK         : "1",
-                  gtk.gdk.MOD2_MASK         : "2",
-                  gtk.gdk.MOD3_MASK         : "3",
-                  gtk.gdk.MOD4_MASK         : "4",
-                  gtk.gdk.MOD5_MASK         : "5"
+                  SHIFT_MASK        : "S",
+                  LOCK_MASK         : "L",
+                  CONTROL_MASK      : "C",
+                  MOD1_MASK         : "1",
+                  MOD2_MASK         : "2",
+                  MOD3_MASK         : "3",
+                  MOD4_MASK         : "4",
+                  MOD5_MASK         : "5"
                   }
 
 class KeyboardStateInfoWindow:
 
     def    __init__(self):
-        self.window = gtk.Window(gtk.WINDOW_TOPLEVEL)
+        self.window = gtk.Window()
         self.window.connect("destroy", self.destroy)
         self.window.set_default_size(540, 800)
         self.window.set_border_width(20)
+        self.window.set_title("Keyboard State Tool")
 
         # Title
         vbox = gtk.VBox(False, 0)
@@ -63,19 +67,20 @@ class KeyboardStateInfoWindow:
 
         self.window.add(vbox)
         self.window.show_all()
-        gobject.timeout_add(100, self.populate_modifiers)
+        glib.timeout_add(100, self.populate_modifiers)
 
-        self.key_events = maxdeque(maxlen=35)
+        self.key_events = deque(maxlen=35)
         self.window.connect("key-press-event", self.key_press)
         self.window.connect("key-release-event", self.key_release)
-        self.window.window.set_cursor(gtk.gdk.Cursor(gtk.gdk.HAND2))
+        if not is_gtk3():
+            self.window.window.set_cursor(gtk.gdk.Cursor(gtk.gdk.HAND2))
 
         icon = get_icon("keyboard.png")
         if icon:
             self.window.set_icon(icon)
 
     def populate_modifiers(self, *args):
-        (x, y, current_mask) = gtk.gdk.get_default_root_window().get_pointer()
+        (x, y, current_mask) = self.window.get_root_window().get_pointer()[-3:]
         self.mouse.set_text("%s %s" % (x, y))
         modifiers = self.mask_to_names(current_mask, modifier_names)
         self.modifiers.set_text(str(modifiers))
@@ -96,7 +101,7 @@ class KeyboardStateInfoWindow:
 
     def add_key_event(self, etype, event):
         modifiers = self.mask_to_names(event.state, short_modifier_names)
-        name = gtk.gdk.keyval_name(event.keyval)
+        name = gdk.keyval_name(event.keyval)
         text = ""
         for v,l in ((etype, 5), (name, 24), (event.string, 4),
                     (event.keyval, 10), (event.hardware_keycode, 10),
@@ -114,16 +119,12 @@ class KeyboardStateInfoWindow:
 
 
 def main():
-    from xpra.os_util import set_application_name, set_prgname
-    if sys.platform.startswith("win"):
-        from xpra.platform.win32 import set_redirect_output, set_log_filename
-        set_redirect_output(True)
-        set_log_filename("Keyboard_Test.log")
-    init()
-    set_prgname("Keyboard Test Tool")
-    set_application_name("Keyboard Test Tool")
-    KeyboardStateInfoWindow()
-    gtk.main()
+    from xpra.platform import program_context
+    from xpra.log import enable_color
+    with program_context("Keyboard-Test", "Keyboard Test Tool"):
+        enable_color()
+        KeyboardStateInfoWindow()
+        gtk.main()
 
 
 if __name__ == "__main__":

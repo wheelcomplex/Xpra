@@ -4,13 +4,16 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
+
 from xpra.gtk_common.gobject_compat import import_gobject
 gobject = import_gobject()
-
-
+gobject.threads_init()
+try:
+    SIGNAL_RUN_LAST = gobject.SIGNAL_RUN_LAST
+except:
+    SIGNAL_RUN_LAST = gobject.SignalFlags.RUN_LAST
 def n_arg_signal(n):
-    return (gobject.SIGNAL_RUN_LAST,
-            gobject.TYPE_NONE, (gobject.TYPE_PYOBJECT,) * n)
+    return (SIGNAL_RUN_LAST, gobject.TYPE_NONE, (gobject.TYPE_PYOBJECT,) * n)
 no_arg_signal = n_arg_signal(0)
 one_arg_signal = n_arg_signal(1)
 

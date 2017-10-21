@@ -1,16 +1,24 @@
 # This file is part of Xpra.
 # Copyright (C) 2008, 2009 Nathaniel Smith <njs@pobox.com>
-# Copyright (C) 2010-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2010-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
+
+#cython: auto_pickle=False
 
 import os
 import time
 
-from xpra.util import dump_exc, AdHocStruct
 from xpra.log import Logger
-log = Logger("xpra.x11.bindings.keyboard_bindings")
+log = Logger("x11", "bindings", "keyboard")
 
+from xpra.os_util import bytestostr, strtobytes
+from libc.stdint cimport uintptr_t
+
+
+DEF PATH_MAX = 1024
+DEF DFLT_XKB_RULES_FILE = "base"
+DEF DFLT_XKB_CONFIG_ROOT = "/usr/share/X11/xkb"
 
 ###################################
 # Headers, python magic
@@ -18,6 +26,10 @@ log = Logger("xpra.x11.bindings.keyboard_bindings")
 cdef extern from "stdlib.h":
     void* malloc(size_t __size)
     void free(void* mem)
+
+cdef extern from "locale.h":
+    char *setlocale(int category, const char *locale)
+    int LC_ALL
 
 cdef extern from "X11/Xutil.h":
     pass
@@ -42,6 +54,7 @@ cdef extern from "X11/Xlib.h":
     ctypedef CARD32 XID
 
     ctypedef int Bool
+    ctypedef int Status
     ctypedef CARD32 Atom
     ctypedef XID Window
     ctypedef XID KeySym
@@ -70,11 +83,8 @@ cdef extern from "X11/Xlib.h":
     KeySym* XGetKeyboardMapping(Display* display, KeyCode first_keycode, int keycode_count, int* keysyms_per_keycode_return)
     int XChangeKeyboardMapping(Display* display, int first_keycode, int keysyms_per_keycode, KeySym* keysyms, int num_codes)
     XModifierKeymap* XInsertModifiermapEntry(XModifierKeymap* modifiermap, KeyCode keycode_entry, int modifier)
-    KeySym XKeycodeToKeysym(Display* display, KeyCode keycode, int index)
-    KeySym XStringToKeysym(char* string)
     char* XKeysymToString(KeySym keysym)
 
-    int XChangeKeyboardMapping(Display* display, int first_keycode, int keysyms_per_keycode, KeySym* keysyms, int num_codes)
     int XSetModifierMapping(Display* display, XModifierKeymap* modifiermap)
 
     int XGrabKey(Display * display, int keycode, unsigned int modifiers,
@@ -83,13 +93,64 @@ cdef extern from "X11/Xlib.h":
     int XUngrabKey(Display * display, int keycode, unsigned int modifiers,
                    Window grab_window)
     int XQueryKeymap(Display * display, char [32] keys_return)
-
+    int XFlush(Display *dpy)
 
 
 cdef extern from "X11/extensions/XKB.h":
     unsigned long XkbUseCoreKbd
     unsigned long XkbDfltXIId
     unsigned long XkbBellNotifyMask
+    unsigned long XkbMapNotifyMask
+    unsigned long XkbStateNotifyMask
+    unsigned int XkbGBN_AllComponentsMask
+    unsigned int XkbGBN_GeometryMask
+
+cdef extern from "X11/extensions/XKBstr.h":
+    ctypedef struct XkbComponentNamesRec:
+        char *                   keymap
+        char *                   keycodes
+        char *                   types
+        char *                   compat
+        char *                   symbols
+        char *                   geometry
+    ctypedef XkbComponentNamesRec*  XkbComponentNamesPtr
+    ctypedef struct XkbDescRec:
+        pass
+    ctypedef XkbDescRec* XkbDescPtr
+    ctypedef struct _XkbStateRec:
+        unsigned char   group
+    ctypedef _XkbStateRec XkbStateRec
+    ctypedef _XkbStateRec *XkbStatePtr
+
+
+cdef extern from "X11/extensions/XKBrules.h":
+    #define _XKB_RF_NAMES_PROP_ATOM         "_XKB_RULES_NAMES"
+    #unsigned int _XKB_RF_NAMES_PROP_MAXLEN
+
+    ctypedef struct XkbRF_RulesRec:
+        pass
+
+    ctypedef XkbRF_RulesRec* XkbRF_RulesPtr
+
+    ctypedef struct XkbRF_VarDefsRec:
+        char *                  model
+        char *                  layout
+        char *                  variant
+        char *                  options
+        unsigned short          sz_extra
+        unsigned short          num_extra
+        char *                  extra_names
+        char **                 extra_values
+
+    ctypedef XkbRF_VarDefsRec* XkbRF_VarDefsPtr
+
+    Bool XkbLibraryVersion(int *major , int *minor)
+
+    Bool XkbRF_GetNamesProp(Display *dpy, char **rules_file_rtrn, XkbRF_VarDefsPtr var_defs_rtrn)
+    Bool XkbRF_SetNamesProp(Display *dpy, char *rules_file, XkbRF_VarDefsPtr var_defs)
+    Bool XkbRF_GetComponents(XkbRF_RulesPtr rules, XkbRF_VarDefsPtr var_defs, XkbComponentNamesPtr names)
+    XkbRF_RulesPtr XkbRF_Load(char *base, char *locale, Bool wantDesc, Bool wantRules)
+
 
 cdef extern from "X11/XKBlib.h":
     KeySym XkbKeycodeToKeysym(Display *display, KeyCode kc, int group, int level)
@@ -99,15 +160,21 @@ cdef extern from "X11/XKBlib.h":
     Bool XkbSetAutoRepeatRate(Display *, unsigned int deviceSpec, unsigned int delay, unsigned int interval)
     Bool XkbGetAutoRepeatRate(Display *, unsigned int deviceSpec, unsigned int *delayRtrn, unsigned int *intervalRtrn)
 
+    XkbDescPtr XkbGetKeyboardByName(Display *display, unsigned int deviceSpec, XkbComponentNamesPtr names,
+                                    unsigned int want, unsigned int need, Bool load)
+    Status XkbGetState(Display *dpy, unsigned int deviceSpec, XkbStatePtr statePtr)
+    Bool   XkbLockGroup(Display *dpy, unsigned int deviceSpec, unsigned int group)
+
 
 cdef extern from "X11/extensions/XTest.h":
-    Bool XTestQueryExtension(Display *, int *, int *,
-                             int * major, int * minor)
+    Bool XTestQueryExtension(Display *display, int *event_base_return, int *error_base_return,
+                                int * major, int * minor)
     int XTestFakeKeyEvent(Display *, unsigned int keycode,
                           Bool is_press, unsigned long delay)
     int XTestFakeButtonEvent(Display *, unsigned int button,
                              Bool is_press, unsigned long delay)
-
+    int XTestFakeMotionEvent(Display * display, int screen_number, int x, int y, unsigned long delay)
+    int XTestFakeRelativeMotionEvent(Display * display, int x, int y, unsigned long delay)
 
 cdef extern from "X11/extensions/Xfixes.h":
     ctypedef struct XFixesCursorNotify:
@@ -150,27 +217,224 @@ cdef extern from "X11/extensions/xfixeswire.h":
     void XFixesSelectCursorInput(Display *, Window w, long mask)
 
 
+cdef NS(char *v):
+    if v==NULL:
+        return "NULL"
+    return str(v)
+
+cdef s(const char *v):
+    pytmp = v[:]
+    try:
+        return pytmp.decode()
+    except:
+        return str(v[:])
+
+
 # xmodmap's "keycode" action done implemented in python
 # some of the methods aren't very pythonic
 # that's intentional so as to keep as close as possible
 # to the original C xmodmap code
 
 
-from core_bindings cimport X11CoreBindings
+from core_bindings cimport _X11CoreBindings
 
+cdef _X11KeyboardBindings singleton = None
+def X11KeyboardBindings():
+    global singleton
+    if singleton is None:
+        singleton = _X11KeyboardBindings()
+    return singleton
 
-cdef class X11KeyboardBindings(X11CoreBindings):
+cdef class _X11KeyboardBindings(_X11CoreBindings):
 
     cdef XModifierKeymap* work_keymap
     cdef int min_keycode
     cdef int max_keycode
-    cdef int xtest_supported
+    cdef int Xkb_checked
+    cdef int Xkb_version_major
+    cdef int Xkb_version_minor
+    cdef int XTest_checked
+    cdef int XTest_version_major
+    cdef int XTest_version_minor
+    cdef int XFixes_checked
+    cdef int XFixes_present
 
     def __init__(self):
         self.work_keymap = NULL
         self.min_keycode = -1
         self.max_keycode = -1
-        self.xtest_supported = -1
+
+    def __repr__(self):
+        return "X11KeyboardBindings(%s)" % self.display_name
+
+
+    cpdef int setxkbmap(self, rules_name, model, layout, variant, options) except -1:
+        log("setxkbmap(%s, %s, %s, %s, %s)", rules_name, model, layout, variant, options)
+        if not self.hasXkb():
+            log.error("Error: no Xkb support in this X11 server, cannot set keymap")
+            return False
+        cdef XkbRF_RulesPtr rules = NULL
+        cdef XkbRF_VarDefsRec rdefs
+        cdef XkbComponentNamesRec rnames
+        cdef char *locale = setlocale(LC_ALL, NULL)
+        log("setxkbmap: using locale=%s", locale)
+
+        #we have to use a temporary value for older versions of Cython:
+        v = model or b""
+        rdefs.model = v
+        rdefs.layout = layout
+        if variant:
+            rdefs.variant = variant
+        else:
+            rdefs.variant = NULL
+        if options:
+            rdefs.options = options
+        else:
+            rdefs.options = NULL
+        if not rules_name:
+            rules_name = DFLT_XKB_RULES_FILE
+
+        log("setxkbmap: using %s", {"rules" : rules_name, "model" : NS(rdefs.model),
+                                     "layout" : NS(rdefs.layout), "variant" : NS(rdefs.variant),
+                                     "options" : NS(rdefs.options)})
+        #try to load rules files from all include paths until the first
+        #we succeed with
+        for include_path in (".", DFLT_XKB_CONFIG_ROOT):
+            rules_path = os.path.join(include_path, "rules", rules_name)
+            if len(rules_path)>=PATH_MAX:
+                log.warn("rules path too long: %. Ignored.", rules_path)
+                continue
+            log("setxkbmap: trying to load rules file %s...", rules_path)
+            rules = XkbRF_Load(rules_path, locale, True, True)
+            if rules:
+                log("setxkbmap: loaded rules from %s", rules_path)
+                break
+        if rules==NULL:
+            log.warn("Couldn't find rules file '%s'", rules_name)
+            return False
+
+        # Let the rules file do the magic:
+        assert XkbRF_GetComponents(rules, &rdefs, &rnames), "failed to get components"
+        props = self.getXkbProperties()
+        if rnames.keycodes:
+            props["keycodes"] = str(rnames.keycodes)
+        if rnames.symbols:
+            props["symbols"] = str(rnames.symbols)
+        if rnames.types:
+            props["types"] = str(rnames.types)
+        if rnames.compat:
+            props["compat"] = str(rnames.compat)
+        if rnames.geometry:
+            props["geometry"] = str(rnames.geometry).encode()
+        if rnames.keymap:
+            props["keymap"] = str(rnames.keymap).encode()
+        #note: this value is from XkbRF_VarDefsRec as XkbComponentNamesRec has no layout attribute
+        #(and we want to make sure we don't use the default value from getXkbProperties above)
+        if rdefs.layout:
+            props["layout"] = str(rdefs.layout).encode()
+        log("setxkbmap: properties=%s", props)
+        #strip out strings inside parenthesis if any:
+        filtered_props = {}
+        for k,v in props.items():
+            ps = v.find("(")
+            if ps>=0:
+                v = v[:ps]
+            filtered_props[k] = v
+        log("setxkbmap: filtered properties=%s", filtered_props)
+        cdef XkbDescPtr xkb = XkbGetKeyboardByName(self.display, XkbUseCoreKbd, &rnames,
+                                   XkbGBN_AllComponentsMask,
+                                   XkbGBN_AllComponentsMask & (~XkbGBN_GeometryMask), True)
+        log("setxkbmap: XkbGetKeyboardByName returned %#x", <unsigned long> xkb)
+        if not xkb:
+            log.error("Error loading new keyboard description")
+            return False
+        # update the XKB root property:
+        if rules_name and (model or layout):
+            if not XkbRF_SetNamesProp(self.display, rules_name, &rdefs):
+                log.error("Error updating the XKB names property")
+                return False
+            log("X11 keymap property updated: %s", self.getXkbProperties())
+        return True
+
+    def set_layout_group(self, int grp):
+        log("setting XKB layout group `%s`", grp)
+        if XkbLockGroup(self.display, XkbUseCoreKbd, grp):
+            XFlush(self.display)
+        else:
+            log.warn("Warning: cannot lock on keyboard layout group '%s'", grp)
+        return self.get_layout_group()
+
+    def get_layout_group(self):
+        cdef XkbStateRec xkb_state
+        cdef Status r = XkbGetState(self.display, XkbUseCoreKbd, &xkb_state)
+        if r:
+            log.warn("Warning: cannot get keyboard layout group")
+            return 0
+        return xkb_state.group
+
+    def hasXkb(self):
+        if self.Xkb_checked:
+            return self.Xkb_version_major>0 or self.Xkb_version_minor>0
+        cdef int major, minor, r, opr
+        cdef int evbase, errbase
+        self.Xkb_checked = True
+        if os.environ.get("XPRA_X11_XKB", "1")!="1":
+            log.warn("Xkb disabled using XPRA_X11_XKB")
+            return False
+        r = XkbQueryExtension(self.display, &opr, &evbase, &errbase, &major, &minor)
+        log("XkbQueryExtension version present: %s", bool(r))
+        if not r:
+            log.warn("Warning: Xkb server extension is missing")
+            return False
+        log("XkbQueryExtension version %i.%i, opcode result=%i, event base=%i, error base=%i", major, minor, opr, evbase, errbase)
+        r = XkbLibraryVersion(&major, &minor)
+        log("XkbLibraryVersion version %i.%i, compatible: %s", major, minor, bool(r))
+        if not bool(r):
+            log.warn("Warning: Xkb extension version is incompatible")
+            return False
+        self.Xkb_version_major = major
+        self.Xkb_version_minor = minor
+        return True
+
+
+    def get_default_properties(self):
+        return {
+            "rules"    : "base",
+            "model"    : "pc105",
+            "layout"   : "us",
+            }
+
+    def getXkbProperties(self):
+        if not self.hasXkb():
+            log.warn("Warning: no Xkb support")
+            return {}
+        cdef XkbRF_VarDefsRec vd
+        cdef char *tmp = NULL
+        if XkbRF_GetNamesProp(self.display, &tmp, &vd)==0 or tmp==NULL:
+            log.warn("Error: XkbRF_GetNamesProp failed")
+            return {}
+        v = {}
+        if len(tmp)>0:
+            v["rules"] = s(tmp)
+            XFree(tmp)
+        if vd.model:
+            v["model"]  = s(vd.model)
+            XFree(vd.model)
+        if vd.layout:
+            v["layout"] = s(vd.layout)
+            XFree(vd.layout)
+        if vd.options!=NULL:
+            v["options"] = s(vd.options)
+            XFree(vd.options)
+        #log("vd.num_extra=%s", vd.num_extra)
+        if vd.extra_names:
+            #no idea how to use this!
+            #if vd.num_extra>0:
+            #    for i in range(vd.num_extra):
+            #        v[vd.extra_names[i][:]] = vd.extra_values[] ???
+            XFree(vd.extra_names)
+        log("getXkbProperties()=%s", v)
+        return v
 
     cdef _get_minmax_keycodes(self):
         if self.min_keycode==-1 and self.max_keycode==-1:
@@ -196,25 +460,28 @@ cdef class X11KeyboardBindings(X11CoreBindings):
 
     cdef XModifierKeymap* get_keymap(self, load):
         if self.work_keymap==NULL and load:
-            log.debug("retrieving keymap")
             self.work_keymap = XGetModifierMapping(self.display)
+            log("retrieved work keymap: %#x", <unsigned long> self.work_keymap)
         return self.work_keymap
 
-    cdef set_keymap(self, XModifierKeymap* new_keymap):
-        log.debug("setting new keymap")
+    cdef set_work_keymap(self, XModifierKeymap* new_keymap):
+        log("setting new work keymap: %#x", <unsigned long> new_keymap)
         self.work_keymap = new_keymap
 
-    cdef _parse_keysym(self, symbol):
+    cdef KeySym _parse_keysym(self, symbol):
         cdef KeySym keysym
         if symbol in ["NoSymbol", "VoidSymbol"]:
             return  NoSymbol
-        keysym = XStringToKeysym(symbol)
+        s = strtobytes(symbol)
+        keysym = XStringToKeysym(s)
         if keysym==NoSymbol:
+            if symbol.startswith("U+"):
+                symbol = "0x"+symbol[2:]
             if symbol.lower().startswith("0x"):
                 return int(symbol, 16)
             if len(symbol)>0 and symbol[0] in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]:
                 return int(symbol)
-            return  None
+            return NoSymbol
         return keysym
 
     def parse_keysym(self, symbol):
@@ -223,8 +490,10 @@ cdef class X11KeyboardBindings(X11CoreBindings):
     cdef _keysym_str(self, keysym_val):
         cdef KeySym keysym                      #@DuplicatedSignature
         keysym = int(keysym_val)
-        s = XKeysymToString(keysym)
-        return s
+        cdef char *s = XKeysymToString(keysym)
+        if s==NULL:
+            return ""
+        return bytestostr(s)
 
     def keysym_str(self, keysym_val):
         return self._keysym_str(keysym_val)
@@ -234,13 +503,15 @@ cdef class X11KeyboardBindings(X11CoreBindings):
             by calling parse_keysym on each one
         """
         keysymlist = []
+        cdef KeySym keysym
         for x in symbols:
             keysym = self._parse_keysym(x)
-            if keysym is not None:
+            if keysym!=NoSymbol:
                 keysymlist.append(keysym)
         return keysymlist
 
-    cdef _parse_keycode(self, keycode_str):
+    cdef int _parse_keycode(self, keycode_str):
+        cdef int keycode
         if keycode_str=="any":
             #find a free one:
             keycode = 0
@@ -251,7 +522,7 @@ cdef class X11KeyboardBindings(X11CoreBindings):
             keycode = int(keycode_str)
         min_keycode, max_keycode = self._get_minmax_keycodes()
         if keycode!=0 and keycode<min_keycode or keycode>max_keycode:
-            log.error("keycode %s: value %s is out of range (%s-%s)", keycode_str, keycode, min_keycode, max_keycode)
+            log.error("Error for keycode '%s': value %i is out of range (%s-%s)", keycode_str, keycode, min_keycode, max_keycode)
             return -1
         return keycode
 
@@ -261,47 +532,50 @@ cdef class X11KeyboardBindings(X11CoreBindings):
     cdef xmodmap_setkeycodes(self, keycodes, new_keysyms):
         cdef KeySym keysym                      #@DuplicatedSignature
         cdef KeySym* ckeysyms
-        cdef int num_codes
+        cdef int num_codes, keycode, i, first_keycode, last_keycode
         cdef int keysyms_per_keycode
-        cdef first_keycode
         first_keycode = min(keycodes.keys())
         last_keycode = max(keycodes.keys())
         num_codes = 1+last_keycode-first_keycode
         MAX_KEYSYMS_PER_KEYCODE = 8
         keysyms_per_keycode = min(MAX_KEYSYMS_PER_KEYCODE, max([1]+[len(keysyms) for keysyms in keycodes.values()]))
-        log.debug("xmodmap_setkeycodes using %s keysyms_per_keycode", keysyms_per_keycode)
-        ckeysyms = <KeySym*> malloc(sizeof(KeySym)*num_codes*keysyms_per_keycode)
+        log("xmodmap_setkeycodes using %s keysyms_per_keycode", keysyms_per_keycode)
+        cdef size_t l = sizeof(KeySym)*num_codes*keysyms_per_keycode
+        ckeysyms = <KeySym*> malloc(l)
+        if ckeysyms==NULL:
+            log.error("Error: failed to allocate %i bytes of memory for keysyms" % l)
+            return False
         try:
             missing_keysyms = []
             for i in range(0, num_codes):
                 keycode = first_keycode+i
                 keysyms_strs = keycodes.get(keycode)
-                log.debug("setting keycode %s: %s", keycode, keysyms_strs)
+                log("setting keycode %i: %s", keycode, keysyms_strs)
                 if keysyms_strs is None:
                     if len(new_keysyms)>0:
                         #no keysyms for this keycode yet, assign one of the "new_keysyms"
                         keysyms = new_keysyms[:1]
                         new_keysyms = new_keysyms[1:]
-                        log.debug("assigned keycode %s to %s", keycode, keysyms[0])
+                        log("assigned keycode %i to %s", keycode, keysyms[0])
                     else:
                         keysyms = []
-                        log.debug("keycode %s is still free", keycode)
+                        log("keycode %i is still free", keycode)
                 else:
                     keysyms = []
                     for ks in keysyms_strs:
                         if ks in (None, ""):
-                            k = None
+                            keysym = NoSymbol
                         elif type(ks) in [long, int]:
-                            k = ks
+                            keysym = ks
                         else:
-                            k = self.parse_keysym(ks)
-                        if k is not None:
-                            keysyms.append(k)
+                            keysym = self._parse_keysym(ks)
+                        if keysym!=NoSymbol:
+                            keysyms.append(keysym)
                         else:
                             keysyms.append(NoSymbol)
-                            if ks is not None:
+                            if ks:
                                 missing_keysyms.append(str(ks))
-                for j in range(0, keysyms_per_keycode):
+                for j in range(keysyms_per_keycode):
                     keysym = NoSymbol
                     if keysyms and j<len(keysyms) and keysyms[j] is not None:
                         keysym = keysyms[j]
@@ -313,6 +587,8 @@ cdef class X11KeyboardBindings(X11CoreBindings):
             free(ckeysyms)
 
     cdef KeysymToKeycodes(self, KeySym keysym):
+        if not self.hasXkb():
+            return []
         cdef int i, j
         min_keycode, max_keycode = self._get_minmax_keycodes()
         keycodes = []
@@ -334,19 +610,18 @@ cdef class X11KeyboardBindings(X11CoreBindings):
         cdef KeySym keysym                              #@DuplicatedSignature
         cdef KeyCode keycode
         min_keycode,max_keycode = self._get_minmax_keycodes()
-        keyboard_map = XGetKeyboardMapping(self.display, min_keycode, max_keycode - min_keycode + 1, &keysyms_per_keycode)
-        log.debug("XGetKeyboardMapping keysyms_per_keycode=%s", keysyms_per_keycode)
+        cdef int keycode_count = max_keycode - min_keycode + 1
+        keyboard_map = XGetKeyboardMapping(self.display, min_keycode, keycode_count, &keysyms_per_keycode)
+        log("XGetKeyboardMapping keysyms_per_keycode=%i, keyboard_map=%#x", keysyms_per_keycode, <uintptr_t> keyboard_map)
         mappings = {}
-        i = 0
-        keycode = min_keycode
-        while keycode<max_keycode:
+        cdef int i
+        for i in range(keycode_count):
+            keycode = min_keycode + i
             keysyms = []
-            for keysym_index in range(0, keysyms_per_keycode):
+            for keysym_index in range(keysyms_per_keycode):
                 keysym = keyboard_map[i*keysyms_per_keycode + keysym_index]
                 keysyms.append(keysym)
             mappings[keycode] = keysyms
-            i += 1
-            keycode += 1
         XFree(keyboard_map)
         return mappings
 
@@ -367,7 +642,7 @@ cdef class X11KeyboardBindings(X11CoreBindings):
                 if keysym!=NoSymbol:
                     keyname = XKeysymToString(keysym)
                     if keyname!=NULL:
-                        key = str(keyname)
+                        key = bytestostr(keyname)
                 keynames.append(key)
             #now remove trailing empty entries:
             while len(keynames)>0 and keynames[-1]=="":
@@ -379,7 +654,7 @@ cdef class X11KeyboardBindings(X11CoreBindings):
 
     def get_keycodes(self, keyname):
         codes = []
-        keysym = self._parse_keysym(keyname)
+        cdef KeySym keysym = self._parse_keysym(keyname)
         if not keysym:
             return  codes
         return self.KeysymToKeycodes(keysym)
@@ -439,7 +714,7 @@ cdef class X11KeyboardBindings(X11CoreBindings):
                 i += 1
             mappings[modifier] = keycodes
         XFreeModifiermap(keymap)
-        self.set_keymap(NULL)
+        self.set_work_keymap(NULL)
         XFree(keyboard_map)
         return (keysyms_per_keycode, mappings)
 
@@ -449,6 +724,7 @@ cdef class X11KeyboardBindings(X11CoreBindings):
         (index and keycode), so here we convert into names:
         """
         cdef KeySym keysym                      #@DuplicatedSignature
+        cdef char *keyname
         keysyms_per_keycode, raw_mappings = self._get_raw_modifier_mappings()
         mappings = {}
         for mod, keycodes in raw_mappings.items():
@@ -464,11 +740,15 @@ cdef class X11KeyboardBindings(X11CoreBindings):
                     keysym = XkbKeycodeToKeysym(self.display, keycode, index//4, index%4)
                     index += 1
                 if keysym==0:
-                    log.info("no keysym found for keycode %s", keycode)
+                    log.warn("Warning: no keysym found for keycode %i of modifier %s", keycode, modifier)
                     continue
                 keyname = XKeysymToString(keysym)
-                if keyname not in keynames:
-                    keynames.append((keycode, keyname))
+                if keyname==NULL:
+                    log.warn("Warning: cannot convert keysym %i to a string", keysym)
+                    continue
+                kstr = bytestostr(keyname)
+                if kstr not in keynames:
+                    keynames.append((keycode, kstr))
             mappings[modifier] = keynames
         return mappings
 
@@ -480,7 +760,7 @@ cdef class X11KeyboardBindings(X11CoreBindings):
         cdef XModifierKeymap* keymap                    #@DuplicatedSignature
         keymap = self.get_keymap(True)
         keycode = <KeyCode*> keymap.modifiermap
-        log.debug("clear modifier: clearing all %s for modifier=%s", keymap.max_keypermod, modifier)
+        log("clear modifier: clearing all %i for modifier=%s", keymap.max_keypermod, modifier)
         for i in range(0, keymap.max_keypermod):
             keycode[modifier*keymap.max_keypermod+i] = 0
 
@@ -490,12 +770,12 @@ cdef class X11KeyboardBindings(X11CoreBindings):
         cdef KeySym keysym                              #@DuplicatedSignature
         keymap = self.get_keymap(True)
         success = True
-        log.debug("add modifier: modifier %s=%s", modifier, keysyms)
+        log("add modifier: modifier %s=%s", modifier, keysyms)
         for keysym_str in keysyms:
             keysym = XStringToKeysym(keysym_str)
-            log.debug("add modifier: keysym(%s)=%s", keysym_str, keysym)
+            log("add modifier: keysym(%s)=%s", keysym_str, keysym)
             keycodes = self.KeysymToKeycodes(keysym)
-            log.debug("add modifier: keycodes(%s)=%s", keysym, keycodes)
+            log("add modifier: keycodes(%s)=%s", keysym, keycodes)
             if len(keycodes)==0:
                 log.error("xmodmap_exec_add: no keycodes found for keysym %s/%s", keysym_str, keysym)
                 success = False
@@ -505,8 +785,8 @@ cdef class X11KeyboardBindings(X11CoreBindings):
                         keycode = k
                         keymap = XInsertModifiermapEntry(keymap, keycode, modifier)
                         if keymap!=NULL:
-                            self.set_keymap(keymap)
-                            log.debug("add modifier: added keycode=%s for modifier %s and keysym=%s", k, modifier, keysym_str)
+                            self.set_work_keymap(keymap)
+                            log("add modifier: added keycode=%s for modifier %s and keysym=%s", k, modifier, keysym_str)
                         else:
                             log.error("add modifier: failed keycode=%s for modifier %s and keysym=%s", k, modifier, keysym_str)
                             success = False
@@ -527,17 +807,25 @@ cdef class X11KeyboardBindings(X11CoreBindings):
         return down
 
     def get_keycodes_down(self):
+        if not self.hasXkb():
+            {}
         cdef Display * display                          #@DuplicatedSignature
         cdef char* key
+        cdef KeySym keysym
         keycodes = self._get_keycodes_down()
         keys = {}
         for keycode in keycodes:
             keysym = XkbKeycodeToKeysym(self.display, keycode, 0, 0)
+            if keysym==NoSymbol:
+                continue
             key = XKeysymToString(keysym)
-            keys[keycode] = str(key)
+            if key!=NULL:
+                keys[keycode] = bytestostr(key)
         return keys
 
     def unpress_all_keys(self):
+        if not self.hasXTest():
+            return
         keycodes = self._get_keycodes_down()
         for keycode in keycodes:
             XTestFakeKeyEvent(self.display, keycode, False, 0)
@@ -545,14 +833,14 @@ cdef class X11KeyboardBindings(X11CoreBindings):
     cdef native_xmodmap(self, instructions):
         cdef XModifierKeymap* keymap                    #@DuplicatedSignature
         cdef int modifier
-        self.set_keymap(NULL)
+        self.set_work_keymap(NULL)
         unhandled = []
         map = None
         keycodes = {}
         new_keysyms = []
         try:
             for line in instructions:
-                log.debug("processing: %s", line)
+                log("processing: %s", line)
                 if not line:
                     continue
                 cmd = line[0]
@@ -584,21 +872,22 @@ cdef class X11KeyboardBindings(X11CoreBindings):
                 log.error("native_xmodmap could not handle instruction: %s", line)
                 unhandled.append(line)
             if len(keycodes)>0:
-                log.debug("calling xmodmap_setkeycodes with %s", keycodes)
+                log("calling xmodmap_setkeycodes with %s", keycodes)
                 self.xmodmap_setkeycodes(keycodes, new_keysyms)
         finally:
             keymap = self.get_keymap(False)
             if keymap!=NULL:
-                self.set_keymap(NULL)
-                log.debug("saving modified keymap")
+                self.set_work_keymap(NULL)
+                log("saving modified keymap")
                 if XSetModifierMapping(self.display, keymap)==MappingBusy:
                     log.error("cannot change keymap: mapping busy: %s" % self.get_keycodes_down())
                     unhandled = instructions
                 XFreeModifiermap(keymap)
-        log.debug("modify keymap: %s instructions, %s unprocessed", len(instructions), len(unhandled))
+        log("modify keymap: %s instructions, %s unprocessed", len(instructions), len(unhandled))
         return unhandled
 
     def set_xmodmap(self, xmodmap_data):
+        log("set_xmodmap(%s)", xmodmap_data)
         return self.native_xmodmap(xmodmap_data)
 
     def grab_key(self, xwindow, keycode, modifiers):
@@ -619,48 +908,71 @@ cdef class X11KeyboardBindings(X11CoreBindings):
         XUngrabKey(self.display, AnyKey, AnyModifier, root_window)
 
 
-    cdef get_xatom(self, str_or_int):
+    cdef Atom get_xatom(self, str_or_int):
         """Returns the X atom corresponding to the given Python string or Python
         integer (assumed to already be an X atom)."""
         cdef char* string
         if isinstance(str_or_int, (int, long)):
             return <Atom> str_or_int
-        string = str_or_int
+        bstr = strtobytes(str_or_int)
+        string = bstr
         return XInternAtom(self.display, string, False)
 
     def device_bell(self, xwindow, deviceSpec, bellClass, bellID, percent, name):
-        name_atom = self.get_xatom(name)
+        if not self.hasXkb():
+            return
+        cdef Atom name_atom = self.get_xatom(name)
         #until (if ever) we replicate the same devices on the server,
         #use the default device:
-        deviceSpec = XkbUseCoreKbd
-        bellID = XkbDfltXIId
-        return XkbDeviceBell(self.display, xwindow, deviceSpec, bellClass, bellID,  percent, name_atom)
+        #deviceSpec = XkbUseCoreKbd
+        #bellID = XkbDfltXIId
+        return XkbDeviceBell(self.display, xwindow, XkbUseCoreKbd, bellClass, XkbDfltXIId,  percent, name_atom)
 
 
+    def hasXTest(self):
+        if self.XTest_checked:
+            return self.XTest_version_major>0 or self.XTest_version_minor>0
+        self.XTest_checked = True
+        if os.environ.get("XPRA_X11_XTEST", "1")!="1":
+            log.warn("XTest disabled using XPRA_X11_XTEST")
+            return False
+        cdef int r
+        cdef int evbase, errbase
+        cdef int major, minor
+        r = XTestQueryExtension(self.display, &evbase, &errbase, &major, &minor)
+        if not r:
+            log.warn("Warning: XTest extension is missing")
+            return False
+        log("XTestQueryExtension found version %i.%i with event base=%i, error base=%i", major, minor, evbase, errbase)
+        self.XTest_version_major = major
+        self.XTest_version_minor = minor
+        return True
 
-
-    def _ensure_XTest_support(self):
-        cdef int ignored = 0
-        if self.xtest_supported==-1:
-            try:
-                XTestQueryExtension(self.display, &ignored, &ignored, &ignored, &ignored)
-                self.xtest_supported = 1
-            except:
-                self.xtest_supported = 0
-        assert self.xtest_supported==1
 
     def xtest_fake_key(self, keycode, is_press):
-        self._ensure_XTest_support()
-        XTestFakeKeyEvent(self.display, keycode, is_press, 0)
+        if not self.hasXTest():
+            return False
+        return XTestFakeKeyEvent(self.display, keycode, is_press, 0)
 
     def xtest_fake_button(self, button, is_press):
-        self._ensure_XTest_support()
-        XTestFakeButtonEvent(self.display, button, is_press, 0)
+        if not self.hasXTest():
+            return False
+        return XTestFakeButtonEvent(self.display, button, is_press, 0)
 
+    def xtest_fake_motion(self, int screen, int x, int y, int delay=0):
+        if not self.hasXTest():
+            return False
+        return XTestFakeMotionEvent(self.display, screen, x, y, delay)
 
+    def xtest_fake_relative_motion(self, int x, int y, int delay=0):
+        if not self.hasXTest():
+            return False
+        return XTestFakeRelativeMotionEvent(self.display, x, y, delay)
 
 
     def get_key_repeat_rate(self):
+        if not self.hasXkb():
+            return None
         cdef unsigned int deviceSpec = XkbUseCoreKbd
         cdef unsigned int delay = 0
         cdef unsigned int interval = 0
@@ -669,27 +981,45 @@ cdef class X11KeyboardBindings(X11CoreBindings):
         return (delay, interval)
 
     def set_key_repeat_rate(self, delay, interval):
+        if not self.hasXkb():
+            log.warn("Warning: cannot set key repeat rate without Xkb support")
+            return False
         cdef unsigned int deviceSpec = XkbUseCoreKbd    #@DuplicatedSignature
         cdef unsigned int cdelay = delay
         cdef unsigned int cinterval = interval
         return XkbSetAutoRepeatRate(self.display, deviceSpec, cdelay, cinterval)
 
 
+    def hasXFixes(self):
+        cdef int evbase, errbase
+        if not self.XFixes_checked:
+            self.XFixes_checked = True
+            if os.environ.get("XPRA_X11_XFIXES", "1")!="1":
+                log.warn("XFixes disabled using XPRA_X11_XFIXES")
+            else:
+                self.XFixes_present = XFixesQueryExtension(self.display, &evbase, &errbase)
+                log("XFixesQueryExtension version present: %s", bool(self.XFixes_present))
+                if self.XFixes_present:
+                    log("XFixesQueryExtension event base=%i, error base=%i", evbase, errbase)
+                else:
+                    log.warn("Warning: XFixes extension is missing")
+        return bool(self.XFixes_present)
 
     def get_cursor_image(self):
+        if not self.hasXFixes():
+            return None
         cdef XFixesCursorImage* image = NULL
         cdef int n, i = 0
         cdef unsigned char r, g, b, a
         cdef unsigned long argb
         try:
-            from xpra.codecs.argb.argb import make_byte_buffer, byte_buffer_to_buffer
             image = XFixesGetCursorImage(self.display)
             if image==NULL:
                 return  None
             n = image.width*image.height
             #Warning: we need to iterate over the input one *long* at a time
             #(even though only 4 bytes are set - and longs are 8 bytes on 64-bit..)
-            pixels = make_byte_buffer(n*4)
+            pixels = bytearray(n*4)
             while i<n:
                 argb = image.pixels[i] & 0xffffffff
                 a = (argb >> 24)   & 0xff
@@ -703,28 +1033,31 @@ cdef class X11KeyboardBindings(X11CoreBindings):
                 i += 1
             name = str(image.name)
             return [image.x, image.y, image.width, image.height, image.xhot, image.yhot,
-                image.cursor_serial, byte_buffer_to_buffer(pixels), name]
+                image.cursor_serial, str(pixels), name]
         finally:
             if image:
                 XFree(image)
 
-    def get_XFixes_event_base(self):
-        cdef int event_base = 0                             #@DuplicatedSignature
-        cdef int error_base = 0                             #@DuplicatedSignature
-        XFixesQueryExtension(self.display, &event_base, &error_base)
-        return int(event_base)
 
     def selectCursorChange(self, on):
+        if not self.hasXFixes():
+            log.warn("Warning: no cursor change notifications without XFixes support")
+            return
+        cdef Window root_window
+        cdef unsigned int mask = 0
         root_window = XDefaultRootWindow(self.display)
         if on:
-            v = XFixesDisplayCursorNotifyMask
-        else:
-            v = 0
-        XFixesSelectCursorInput(self.display, root_window, v)
+            mask = XFixesDisplayCursorNotifyMask
+        #no return value..
+        XFixesSelectCursorInput(self.display, root_window, mask)
+        return True
 
 
     def selectBellNotification(self, on):
+        if not self.hasXkb():
+            log.warn("Warning: no system bell events without Xkb support")
+            return
         cdef int bits = XkbBellNotifyMask
         if not on:
             bits = 0
-        XkbSelectEvents(self.display, XkbUseCoreKbd, XkbBellNotifyMask, bits)
+        return XkbSelectEvents(self.display, XkbUseCoreKbd, XkbBellNotifyMask, bits)

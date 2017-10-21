@@ -1,30 +1,42 @@
 # This file is part of Xpra.
 # Copyright (C) 2008 Nathaniel Smith <njs@pobox.com>
-# Copyright (C) 2012-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2012-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
 # Taken from BitTorrent 3.4.2 (which is MIT-licensed), then hacked up
 # further.
-
 # Original version written by Petru Paler
 
-__version__ = ("Cython", 0, 11)
+
+__version__ = ("Cython", 0, 13)
+
+from xpra.buffers.membuf cimport object_as_buffer
 
 import sys
-assert sys.version < '3', "not ported to py3k yet"
+if sys.version_info[0]>=3:
+    StringType  = bytes
+    UnicodeType = str
+    IntType     = int
+    LongType    = int
+    DictType    = dict
+    ListType    = list
+    TupleType   = tuple
+    BooleanType = bool
+    import codecs
+    def b(x):
+        if type(x)==bytes:
+            return x
+        return codecs.latin_1_encode(x)[0]
+else:
+    from types import (StringType, UnicodeType, IntType, LongType, DictType, ListType,
+                       TupleType, BooleanType)
+    def b(x):               #@DuplicatedSignature
+        return x
 
-from types import (StringType, UnicodeType, IntType, LongType, DictType, ListType,
-                   TupleType, BooleanType)
 
-cdef int unicode_support = 0
-def set_unicode_support(us):
-    global unicode_support
-    unicode_support = bool(us)
-
-
-cdef int find(const char *p, char c, int start, size_t len):
-    cdef int pos = start
+cdef int find(const unsigned char *p, char c, unsigned int start, size_t len):
+    cdef unsigned int pos = start
     while pos<len:
         if p[pos]==c:
             return pos
@@ -34,40 +46,46 @@ cdef int find(const char *p, char c, int start, size_t len):
 
 # Decoding functions
 
-cdef decode_int(const char *x, int f, int l):
+cdef decode_int(const unsigned char *x, unsigned int f, int l):
     f += 1
     cdef int newf = find(x, 'e', f, l)
     cdef object n
     assert newf>=0, "end of int not found"
+    cdef unsigned int unewf = newf
     try:
-        n = int(x[f:newf])
+        n = int(x[f:unewf])
     except (OverflowError, ValueError):
-        n = long(x[f:newf])
+        n = long(x[f:unewf])
     if x[f] == '-':
         if x[f + 1] == '0':
             raise ValueError("-0 is not a valid number")
-    elif x[f] == '0' and newf != f+1:
+    elif x[f] == '0' and unewf != f+1:
         raise ValueError("leading zeroes are not allowed")
-    return (n, newf+1)
+    return (n, unewf+1)
 
-cdef decode_string(const char *x, int f, int l):
+cdef decode_string(const unsigned char *x, unsigned int f, int l):
     cdef int colon = find(x, ':', f, l)
     cdef int slen
     assert colon>=0, "colon not found in string size header"
+    lenstr = x[f:colon]
+    cdef unsigned int ucolon = colon
     try:
-        slen = int(x[f:colon])
+        slen = IntType(lenstr)
     except (OverflowError, ValueError):
-        slen = long(x[f:colon])
-    if x[f] == '0' and colon != f+1:
+        try:
+            slen = LongType(lenstr)
+        except:
+            raise ValueError("cannot parse length '%s' (f=%s, colon=%s, string=%s)" % (lenstr, f, ucolon, x))
+    if x[f] == '0' and ucolon != f+1:
         raise ValueError("leading zeroes are not allowed (found in string length)")
-    colon += 1
-    return (x[colon:colon+slen], colon+slen)
+    ucolon += 1
+    return (x[ucolon:ucolon+slen], ucolon+slen)
 
-cdef decode_unicode(const char *x, int f, int l):
+cdef decode_unicode(const unsigned char *x, unsigned int f, int l):
     xs, fs = decode_string(x, f+1, l)
     return (xs.decode("utf8"), fs)
 
-cdef decode_list(const char *x, int f, int l):
+cdef decode_list(const unsigned char *x, unsigned int f, int l):
     cdef object r = []
     f += 1
     cdef object v
@@ -76,7 +94,7 @@ cdef decode_list(const char *x, int f, int l):
         r.append(v)
     return (r, f + 1)
 
-cdef decode_dict(const char *x, int f, int l):
+cdef decode_dict(const unsigned char *x, unsigned int f, int l):
     cdef object r = {}
     cdef object k
     cdef object v               #dict value
@@ -86,13 +104,13 @@ cdef decode_dict(const char *x, int f, int l):
         v, f = decode(x, f, l, "dictionary value")
         try:
             r[k] = v
-        except TypeError, e:
+        except TypeError as e:
             raise ValueError("failed to set dictionary key %s: %s" % (k, e))
     return (r, f + 1)
 
 
 #cdef const char *DIGITS = '0123456789'
-cdef decode(const char *x, int f, size_t l, char *what):
+cdef decode(const unsigned char *x, unsigned int f, size_t l, unsigned char *what):
     assert f<l, "cannot decode past the end of the string!"
     cdef char c = x[f]
     if c=='l':
@@ -109,9 +127,11 @@ cdef decode(const char *x, int f, size_t l, char *what):
         raise ValueError("invalid %s type identifier: %s at position %s" % (what, c, f))
 
 def bdecode(x):
-    cdef const char *s = x
-    cdef int f = 0
-    cdef size_t l = len(x)
+    xs = b(x)
+    cdef const unsigned char *s = NULL
+    cdef Py_ssize_t l = 0
+    assert object_as_buffer(xs, <const void **> &s, &l)==0, "failed to convert %s to a buffer" % type(x)
+    cdef unsigned int f = 0
     try:
         return decode(s, f, l, "bencoded string")
     except (IndexError, KeyError):
@@ -121,53 +141,53 @@ def bdecode(x):
 
 # Encoding functions:
 
-cdef void encode_int(x, r) except *:
+cdef int encode_int(x, r) except -1:
     r.extend(('i', str(x), 'e'))
+    return 0
 
-cdef void encode_string(x, r) except *:
+cdef int encode_string(x, r) except -1:
     r.extend((str(len(x)), ':', x))
+    return 0
 
-cdef void encode_unicode(x, r) except *:
-    global unicode_support
+cdef int encode_unicode(x, r) except -1:
     x = x.encode("utf8")
-    if unicode_support:
-        r.extend(('u', str(len(x)), ':', x))
-    else:
-        encode_string(x, r)
+    return encode_string(x, r)
 
-cdef void encode_list(object x, r) except *:
+cdef int encode_list(object x, r) except -1:
     r.append('l')
     for i in x:
-        encode(i, r)
+        assert encode(i, r)==0
     r.append('e')
+    return 0
 
-cdef void encode_dict(object x, r) except *:
+cdef int encode_dict(object x, r) except -1:
     r.append('d')
     for k in sorted(x.keys()):
         v = x[k]
-        encode(k, r)
-        encode(v, r)
+        assert encode(k, r)==0
+        assert encode(v, r)==0
     r.append('e')
+    return 0
 
 
-cdef void encode(object v, r) except *:
+cdef int encode(object v, r) except -1:
     cdef object t = type(v)
     if t==IntType:
-        encode_int(v, r)
+        return encode_int(v, r)
     elif t==LongType:
-        encode_int(v, r)
+        return encode_int(v, r)
     elif t==StringType:
-        encode_string(v, r)
+        return encode_string(v, r)
     elif t==UnicodeType:
-        encode_unicode(v, r)
+        return encode_unicode(v, r)
     elif t==ListType:
-        encode_list(v, r)
+        return encode_list(v, r)
     elif t==TupleType:
-        encode_list(v, r)
+        return encode_list(v, r)
     elif t==DictType:
-        encode_dict(v, r)
+        return encode_dict(v, r)
     elif t==BooleanType:
-        encode_int(long(v), r)
+        return encode_int(long(v), r)
     elif v==None:
         raise ValueError("found None value!")
     else:
@@ -176,9 +196,9 @@ cdef void encode(object v, r) except *:
 def bencode(x):
     r = []
     try:
-        encode(x, r)
-        return ''.join(r)
-    except Exception:
+        assert encode(x, r)==0
+        return b''.join(b(v) for v in r)
+    except Exception as e:
         import traceback
         traceback.print_exc()
-        raise ValueError("cannot encode '%s'" % x)
+        raise ValueError("cannot encode '%s': %s" % (x, e))

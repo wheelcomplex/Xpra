@@ -1,58 +1,37 @@
 #!/usr/bin/env python
 # This file is part of Xpra.
-# Copyright (C) 2011-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2011-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
 # Augments the win32_NotifyIcon "system tray" support class
 # with methods for integrating with win32_balloon and the popup menu
 
-import win32ts, win32con, win32api, win32gui        #@UnresolvedImport
+from ctypes import wintypes, byref
 
-from xpra.platform.win32.win32_NotifyIcon import win32NotifyIcon, WM_TRAY_EVENT, BUTTON_MAP
-from xpra.client.tray_base import TrayBase, log, debug
+from xpra.log import Logger
+log = Logger("tray", "win32")
 
-#had to look this up online:
-NIN_BALLOONSHOW         = win32con.WM_USER + 2
-NIN_BALLOONHIDE         = win32con.WM_USER + 3
-NIN_BALLOONTIMEOUT      = win32con.WM_USER + 4
-NIN_BALLOONUSERCLICK    = win32con.WM_USER + 5
-BALLOON_EVENTS = {
-            NIN_BALLOONSHOW             : "NIN_BALLOONSHOW",
-            NIN_BALLOONHIDE             : "NIN_BALLOONHIDE",
-            NIN_BALLOONTIMEOUT          : "NIN_BALLOONTIMEOUT",
-            NIN_BALLOONUSERCLICK        : "NIN_BALLOONUSERCLICK",
-          }
-#no idea where we're supposed to get those from:
-WM_WTSSESSION_CHANGE        = 0x02b1
-WM_DWMNCRENDERINGCHANGED    = 0x31F
-IGNORE_EVENTS = {
-            win32con.WM_DESTROY             : "WM_DESTROY",
-            win32con.WM_COMMAND             : "WM_COMMAND",
-            win32con.WM_DEVICECHANGE        : "WM_DEVICECHANGE",
-            win32con.WM_DISPLAYCHANGE       : "WM_DISPLAYCHANGE",       #already taken care of by gtk event
-            win32con.WM_WINDOWPOSCHANGING   : "WM_WINDOWPOSCHANGING",
-            win32con.WM_GETMINMAXINFO       : "WM_GETMINMAXINFO",       #could be used to limit window size?
-            WM_WTSSESSION_CHANGE            : "WM_WTSSESSION_CHANGE",
-            WM_DWMNCRENDERINGCHANGED        : "WM_DWMNCRENDERINGCHANGED",
-            }
-KNOWN_WM_EVENTS = {}
-for x in dir(win32con):
-    if x.startswith("WM_"):
-        v = getattr(win32con, x)
-        KNOWN_WM_EVENTS[v] = x
+from xpra.platform.win32 import constants as win32con
+from xpra.platform.win32.gui import EnumDisplayMonitors, GetMonitorInfo
+from xpra.platform.win32.win32_NotifyIcon import win32NotifyIcon
+from xpra.platform.win32.win32_events import get_win32_event_listener
+from xpra.platform.win32.common import GetSystemMetrics, GetCursorPos
+from xpra.client.tray_base import TrayBase
+from xpra.platform.paths import get_icon_filename
 
 
 class Win32Tray(TrayBase):
 
     def __init__(self, *args):
         TrayBase.__init__(self, *args)
+        self.calculate_offset()
         self.default_icon_extension = "ico"
-        self.default_icon_name = "xpra.ico"
-        icon_filename = self.get_tray_icon_filename(self.default_icon_filename)
-        self.tray_widget = win32NotifyIcon(self.tooltip, self.click_cb, self.exit_cb, None, icon_filename)
-        #now let's try to hook the session notification
-        self.detect_win32_session_events(self.getHWND())
+        icon_filename = get_icon_filename(self.default_icon_filename, "ico")
+        self.tray_widget = win32NotifyIcon(self.app_id, self.tooltip, self.move_cb, self.click_cb, self.exit_cb, None, icon_filename)
+        el = get_win32_event_listener()
+        if el:
+            el.add_event_callback(win32con.WM_DISPLAYCHANGE, self.calculate_offset)
 
     def ready(self):
         pass
@@ -64,27 +43,49 @@ class Win32Tray(TrayBase):
         pass
 
 
+    def get_size(self):
+        w = GetSystemMetrics(win32con.SM_CXSMICON)
+        h = GetSystemMetrics(win32con.SM_CYSMICON)
+        return w, h
+
     def getHWND(self):
         if self.tray_widget is None:
             return    None
         return    self.tray_widget.hwnd
 
     def cleanup(self):
-        debug("Win32Tray.cleanup() tray_widget=%s", self.tray_widget)
+        log("Win32Tray.cleanup() tray_widget=%s", self.tray_widget)
         if self.tray_widget:
-            self.stop_win32_session_events(self.getHWND())
             self.tray_widget.close()
             self.tray_widget = None
-        debug("Win32Tray.cleanup() ended")
+        el = get_win32_event_listener()
+        if el:
+            el.remove_event_callback(win32con.WM_DISPLAYCHANGE, self.calculate_offset)
+        log("Win32Tray.cleanup() ended")
+
+    def calculate_offset(self, *args):
+        #GTK returns coordinates as unsigned ints, but win32 can give us negative coordinates!
+        self.offset_x = 0
+        self.offset_y = 0
+        try:
+            for m in EnumDisplayMonitors():
+                mi = GetMonitorInfo(m)
+                mx1, my1, _, _ = mi['Monitor']
+                self.offset_x = max(self.offset_x, -mx1)
+                self.offset_y = max(self.offset_y, -my1)
+        except Exception as e:
+            log("EnumDisplayMonitors()", exc_info=True)
+            log.warn("Warning: failed to query monitors: %s", e)
+        log("calculate_offset() x=%i, y=%i", self.offset_x, self.offset_y)
 
     def set_tooltip(self, name):
         if self.tray_widget:
             self.tray_widget.set_tooltip(name)
 
 
-    def set_icon_from_data(self, pixels, has_alpha, w, h, rowstride):
+    def set_icon_from_data(self, pixels, has_alpha, w, h, rowstride, options={}):
         if self.tray_widget:
-            self.tray_widget.set_icon_from_data(pixels, has_alpha, w, h, rowstride)
+            self.tray_widget.set_icon_from_data(pixels, has_alpha, w, h, rowstride, options)
 
     def do_set_icon_from_file(self, filename):
         if self.tray_widget:
@@ -98,72 +99,15 @@ class Win32Tray(TrayBase):
         return self.geometry_guess
 
 
-    def stop_win32_session_events(self, app_hwnd):
-        try:
-            if self.old_win32_proc and app_hwnd:
-                win32api.SetWindowLong(app_hwnd, win32con.GWL_WNDPROC, self.old_win32_proc)
-                self.old_win32_proc = None
-
-            if app_hwnd:
-                win32ts.WTSUnRegisterSessionNotification(app_hwnd)
-            else:
-                log.warn("stop_win32_session_events(%s) missing handle!", app_hwnd)
-        except:
-            log.error("stop_win32_session_events", exc_info=True)
-
-    def tray_event(self, wParam, lParam):
-        x, y = win32api.GetCursorPos()
-        size = win32api.GetSystemMetrics(win32con.SM_CXSMICON)
-        self.recalculate_geometry(x, y, size, size)
-        if lParam in BALLOON_EVENTS:
-            debug("WM_TRAY_EVENT: %s", BALLOON_EVENTS.get(lParam))
-        elif lParam==win32con.WM_MOUSEMOVE:
-            debug("WM_TRAY_EVENT: WM_MOUSEMOVE")
-            if self.mouseover_cb:
-                self.mouseover_cb(x, y)
-        elif lParam in BUTTON_MAP:
-            debug("WM_TRAY_EVENT: click %s", BUTTON_MAP.get(lParam))
-        else:
-            log.warn("WM_TRAY_EVENT: unknown event: %s / %s", wParam, lParam)
-
-
-    #****************************************************************
-    # Events detection (screensaver / login / logout)
-    def detect_win32_session_events(self, app_hwnd):
-        """
-        Use pywin32 to receive session notification events.
-        """
-        if app_hwnd is None:
-            if self.tray_widget is None:
-                #probably closing down, don't warn
-                return
-            log.warn("detect_win32_session_events(%s) missing handle!", app_hwnd)
-            return
-        try:
-            debug("detect_win32_session_events(%s)", app_hwnd)
-            #register our interest in those events:
-            #http://timgolden.me.uk/python/win32_how_do_i/track-session-events.html#isenslogon
-            #http://stackoverflow.com/questions/365058/detect-windows-logout-in-python
-            #http://msdn.microsoft.com/en-us/library/aa383841.aspx
-            #http://msdn.microsoft.com/en-us/library/aa383828.aspx
-            win32ts.WTSRegisterSessionNotification(app_hwnd, win32ts.NOTIFY_FOR_THIS_SESSION)
-            #catch all events: http://wiki.wxpython.org/HookingTheWndProc
-            self.old_win32_proc = win32gui.SetWindowLong(app_hwnd, win32con.GWL_WNDPROC, self.MyWndProc)
-        except Exception, e:
-            log.error("failed to hook session notifications: %s", e)
-
-    def MyWndProc(self, hWnd, msg, wParam, lParam):
-        assert hWnd==self.getHWND(), "invalid hwnd: %s (expected %s)" % (hWnd, self.getHWND())
-        if msg in IGNORE_EVENTS:
-            debug("%s: %s / %s", IGNORE_EVENTS.get(msg), wParam, lParam)
-        elif msg==WM_TRAY_EVENT:
-            self.tray_event(wParam, lParam)
-        elif msg==win32con.WM_ACTIVATEAPP:
-            debug("WM_ACTIVATEAPP focus changed: %s / %s", wParam, lParam)
-        else:
-            log.warn("unexpected message: %s / %s / %s", KNOWN_WM_EVENTS.get(msg, msg), wParam, lParam)
-        # Pass all messages to the original WndProc
-        try:
-            return win32gui.CallWindowProc(self.old_win32_proc, hWnd, msg, wParam, lParam)
-        except Exception, e:
-            log.error("error delegating call: %s", e)
+    def move_cb(self, *args):
+        pos = wintypes.POINT()
+        GetCursorPos(byref(pos))
+        x, y = pos.x, pos.y
+        w = GetSystemMetrics(win32con.SM_CXSMICON)
+        h = GetSystemMetrics(win32con.SM_CYSMICON)
+        x += self.offset_x
+        y += self.offset_y
+        log("move_cb%s x=%s, y=%s, size=%i, %i", args, x, y, w, h)
+        self.recalculate_geometry(x, y, w, h)
+        if self.mouseover_cb:
+            self.mouseover_cb(x, y)

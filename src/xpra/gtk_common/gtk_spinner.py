@@ -7,10 +7,10 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
-from xpra.gtk_common.gobject_compat import import_gtk, import_gobject
-gtk = import_gtk()
-gobject = import_gobject()
-import cairo
+from xpra.gtk_common.gobject_compat import import_gtk, import_glib, import_cairo
+gtk     = import_gtk()
+glib    = import_glib()
+cairo   = import_cairo()
 import math
 
 
@@ -44,7 +44,7 @@ class Example(gtk.Window):
         self.add(self.darea)
 
         self.count = 0
-        gobject.timeout_add(cv.SPEED, self.on_timer)
+        glib.timeout_add(cv.SPEED, self.on_timer)
 
         self.set_title("Waiting")
         self.resize(250, 150)

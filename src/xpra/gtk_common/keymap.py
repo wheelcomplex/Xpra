@@ -5,38 +5,70 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
-from xpra.util import nn
+from xpra.log import Logger
+log = Logger("keyboard")
+
+#this allows platforms to inject keyname workarounds
+# the key is a tuple (keyname, keyval, keycode)
+# the value is the keyname override
+KEY_TRANSLATIONS = {}
 
 
-def get_gtk_keymap(ignore_keys=[None, "VoidSymbol"]):
+def get_gtk_keymap(ignore_keys=[None, "VoidSymbol", "0xffffff"]):
     """
         Augment the keymap we get from gtk.gdk.keymap_get_default()
         by adding the keyval_name.
         We can also ignore some keys
     """
-    from xpra.gtk_common.gobject_compat import import_gdk
+    from xpra.gtk_common.gtk_util import get_default_keymap, import_gdk, is_gtk3
     gdk = import_gdk()
-    try:
-        keymap = gdk.keymap_get_default()
-    except:
-        keymap = None
-        return  []
+    keymap = get_default_keymap()
+    log("get_default_keymap()=%s, direction=%s, bidirectional layouts: %s", keymap, keymap.get_direction(), keymap.have_bidi_layouts())
     keycodes=[]
-    max_entries = 1
     for i in range(0, 2**8):
         entries = keymap.get_entries_for_keycode(i)
-        if entries:
-            max_entries = max(max_entries, len(entries))
-            for keyval, keycode, group, level in entries:
+        log("get_entries_for_keycode(%s)=%s", i, entries)
+        if not entries:
+            continue
+        if is_gtk3():
+            found, keys, keyvals = entries
+            if not found:
+                continue
+            for i in range(len(keys)):
+                key = keys[i]
+                keyval = keyvals[i]
+                keycode = key.keycode
                 name = gdk.keyval_name(keyval)
+                name = KEY_TRANSLATIONS.get((name, keyval, keycode), name)
                 if name not in ignore_keys:
-                    keycodes.append((nn(keyval), nn(name), nn(keycode), nn(group), nn(level)))
+                    keycodes.append((keyval or 0, name or "", keycode or 0, key.group or 0, key.level or 0))
+        else:
+            #gtk2:
+            for keyval, keycode, group, level in entries:
+                #assert keycode==i
+                name = gdk.keyval_name(keyval)
+                name = KEY_TRANSLATIONS.get((name, keyval, keycode), name)
+                if name not in ignore_keys:
+                    keycodes.append((keyval or 0, name or "", keycode or 0, group or 0, level or 0))
+    log("get_gtk_keymap(%s)=%s (keymap=%s)", ignore_keys, keycodes, keymap)
     return keycodes
 
 
 def main():
-    gtk_keymap = get_gtk_keymap()
-    print("gtk_keymap: (keyval, name, keycode, group, level)\n%s" % ("\n".join([str(x) for x in gtk_keymap])))
+    import sys
+    from xpra.platform import program_context
+    from xpra.log import enable_color
+    with program_context("Keymap-Tool", "Keymap Information Tool"):
+        enable_color()
+        if "-v" in sys.argv or "--verbose" in sys.argv:
+            log.enable_debug()
+        gtk_keymap = get_gtk_keymap()
+        sizes = [16, 28, 8, 8, 8]
+        def pkey(*entries):
+            print(("".join([str(x).ljust(sizes[i]) for i,x in enumerate(entries)])).strip())
+        pkey("keyval", "name", "keycode", "group", "level")
+        for x in gtk_keymap:
+            pkey(*x)
 
 
 if __name__ == "__main__":

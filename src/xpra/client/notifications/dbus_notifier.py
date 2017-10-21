@@ -10,6 +10,18 @@ assert dbus.glib
 import dbus.exceptions
 
 
+def DBUS_Notifier_factory():
+    try:
+        return DBUS_Notifier()
+    except Exception as e:
+        log.warn("failed to instantiate the dbus notification handler:")
+        if str(e).startswith("org.freedesktop.DBus.Error.ServiceUnknown:"):
+            log.warn(" you may need to start a notification service for 'org.freedesktop.Notifications'")
+        else:
+            log.warn(" %s", e)
+        log.warn(" disable notifications to avoid this warning")
+        return None
+
 class DBUS_Notifier(NotifierBase):
 
     def __init__(self):

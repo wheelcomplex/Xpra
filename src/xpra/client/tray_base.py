@@ -1,16 +1,13 @@
 # This file is part of Xpra.
 # Copyright (C) 2010 Nathaniel Smith <njs@pobox.com>
-# Copyright (C) 2011-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2011-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
-import os.path
-
-from xpra.platform.paths import get_icon_dir
-from xpra.log import Logger, debug_if_env
-from xpra.deque import maxdeque
-log = Logger()
-debug = debug_if_env(log, "XPRA_TRAY_DEBUG")
+from xpra.platform.paths import get_icon_filename
+from xpra.log import Logger
+from collections import deque
+log = Logger("tray")
 
 
 class TrayBase(object):
@@ -18,7 +15,10 @@ class TrayBase(object):
         Utility superclass for all tray implementations
     """
 
-    def __init__(self, menu, tooltip, icon_filename, size_changed_cb, click_cb, mouseover_cb, exit_cb):
+    def __init__(self, client, app_id, menu, tooltip, icon_filename, size_changed_cb, click_cb, mouseover_cb, exit_cb):
+        #we don't keep a reference to client,
+        #because calling functions on the client directly should be discouraged
+        self.app_id = app_id
         self.menu = menu
         self.tooltip = tooltip
         self.size_changed_cb = size_changed_cb
@@ -26,27 +26,16 @@ class TrayBase(object):
         self.mouseover_cb = mouseover_cb
         self.exit_cb = exit_cb
         self.tray_widget = None
-        self.default_icon_filename = icon_filename
-        self.default_icon_extension = "png"
-        self.default_icon_name = "xpra.png"
+        self.default_icon_filename = icon_filename      #ie: "xpra" or "/path/to/xpra.png"
         #some implementations need this for guessing the geometry (see recalculate_geometry):
         self.geometry_guess = None
-        self.tray_event_locations = maxdeque(512)
+        self.tray_event_locations = deque(maxlen=512)
+        self.default_icon_extension = "png"
 
     def cleanup(self):
         if self.tray_widget:
             self.hide()
             self.tray_widget = None
-
-    def get_tray_icon_filename(self, cmdlineoverride=None):
-        if cmdlineoverride and os.path.exists(cmdlineoverride):
-            debug("get_tray_icon_filename using %s from command line", cmdlineoverride)
-            return  cmdlineoverride
-        f = os.path.join(get_icon_dir(), self.default_icon_name)
-        if os.path.exists(f):
-            debug("get_tray_icon_filename using default: %s", f)
-            return  f
-        return  None
 
     def ready(self):
         pass
@@ -79,27 +68,23 @@ class TrayBase(object):
     def set_blinking(self, on):
         raise Exception("override me!")
 
-    def set_icon_from_data(self, pixels, has_alpha, w, h, rowstride):
+
+    def set_icon_from_data(self, pixels, has_alpha, w, h, rowstride, options={}):
         raise Exception("override me!")
 
-    def set_icon(self, basefilename=None):
-        if basefilename is None:
-            #use default filename, or find file with default icon name:
-            filename = self.default_icon_filename or self.get_tray_icon_filename()
-        else:
-            #create full path + filename from basefilename:
-            with_ext = "%s.%s" % (basefilename, self.default_icon_extension)
-            icon_dir = get_icon_dir()
-            filename = os.path.join(icon_dir, with_ext)
-        if not os.path.exists(filename):
-            log.error("could not find icon '%s' for name '%s'", filename, basefilename)
+    def get_icon_filename(self, basename=None):
+        return get_icon_filename(basename or self.default_icon_filename, self.default_icon_extension)
+
+    def set_icon(self, basename=None):
+        filename = self.get_icon_filename(basename)
+        if not filename:
+            log.error("Error: cannot find icon '%s' for name '%s'", filename, basename)
             return
-        abspath = os.path.abspath(filename)
-        debug("set_icon(%s) using filename=%s", basefilename, abspath)
-        self.set_icon_from_file(abspath)
+        log("set_icon(%s) using filename=%s", basename, filename)
+        self.set_icon_from_file(filename)
 
     def set_icon_from_file(self, filename):
-        debug("set_icon_from_file(%s) tray_widget=%s", filename, self.tray_widget)
+        log("set_icon_from_file(%s) tray_widget=%s", filename, self.tray_widget)
         if not self.tray_widget:
             return
         self.do_set_icon_from_file(filename)
@@ -108,6 +93,10 @@ class TrayBase(object):
         raise Exception("override me!")
 
     def recalculate_geometry(self, x, y, width, height):
+        log("recalculate_geometry%s tray event locations: %s", (x, y, width, height), len(self.tray_event_locations))
+        if self.geometry_guess is None:
+            #better than nothing!
+            self.geometry_guess = x, y, width, height
         if len(self.tray_event_locations)>0 and self.tray_event_locations[-1]==(x,y):
             #unchanged
             return
@@ -136,10 +125,10 @@ class TrayBase(object):
         padx = width-(maxx-minx)
         pady = height-(maxy-miny)
         assert padx>=0 and pady>=0
-        minx -= padx/2
-        miny -= pady/2
+        minx -= padx//2
+        miny -= pady//2
         oldgeom = self.geometry_guess
-        self.geometry_guess = minx, miny, width, height
-        log("recalculate_geometry() %s", self.geometry_guess)
+        self.geometry_guess = max(0, minx), max(0, miny), width, height
+        log("recalculate_geometry() geometry guess=%s", self.geometry_guess)
         if self.size_changed_cb and self.geometry_guess!=oldgeom:
             self.size_changed_cb()

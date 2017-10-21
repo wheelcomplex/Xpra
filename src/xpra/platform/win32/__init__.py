@@ -1,30 +1,89 @@
 # This file is part of Xpra.
 # Copyright (C) 2010 Nathaniel Smith <njs@pobox.com>
-# Copyright (C) 2011-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2011-2017 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
 # Platform-specific code for Win32.
 
+import errno
 import os.path
 import sys
+import ctypes
 
-LOG_FILENAME = "Xpra.log"
-REDIRECT_OUTPUT = True
-def set_redirect_output(on):
-    global REDIRECT_OUTPUT
-    REDIRECT_OUTPUT = on
-def set_log_filename(filename):
-    global LOG_FILENAME
-    LOG_FILENAME = filename
+from xpra.util import envbool
+from xpra.os_util import PYTHON2
+from ctypes import WINFUNCTYPE, WinDLL, POINTER, byref, c_int
+from ctypes.wintypes import BOOL, HANDLE, DWORD, LPWSTR, LPCWSTR, LPVOID, POINT, WORD, SMALL_RECT
+
+from xpra.platform.win32 import constants as win32con
+from xpra.platform.win32.common import SetConsoleTitleA, GetConsoleScreenBufferInfo, MessageBoxA, GetLastError, kernel32
+
+
+GetStdHandle = WINFUNCTYPE(HANDLE, DWORD)(("GetStdHandle", kernel32))
+STD_OUTPUT_HANDLE = DWORD(-11)
+STD_ERROR_HANDLE = DWORD(-12)
+GetFileType = WINFUNCTYPE(DWORD, DWORD)(("GetFileType", kernel32))
+FILE_TYPE_CHAR = 0x0002
+FILE_TYPE_REMOTE = 0x8000
+GetConsoleMode = WINFUNCTYPE(BOOL, HANDLE, POINTER(DWORD))(("GetConsoleMode", kernel32))
+INVALID_HANDLE_VALUE = DWORD(-1).value
+STDOUT_FILENO = 1
+STDERR_FILENO = 2
+WriteConsoleW = WINFUNCTYPE(BOOL, HANDLE, LPWSTR, DWORD, POINTER(DWORD), LPVOID)(("WriteConsoleW", kernel32))
+
+GetConsoleCP = kernel32.GetConsoleCP
+
+#redirect output if we're not running from a console:
+frozen = getattr(sys, 'frozen', False)
+REDIRECT_OUTPUT = envbool("XPRA_REDIRECT_OUTPUT", frozen is True and GetConsoleCP()==0)
+if frozen:
+    #cx_freeze paths:
+    def jedir(relpathname):
+        return os.path.join(os.path.dirname(sys.executable), relpathname)
+    def addsyspath(relpathname):
+        v = jedir(relpathname)
+        if os.path.exists(v):
+            sys.path.append(v)
+    addsyspath('')
+    addsyspath('bin')
+    addsyspath('bin\\etc')
+    addsyspath('bin\\lib')
+    addsyspath('bin\\share')
+    addsyspath('bin\\library.zip')
+    os.environ['GI_TYPELIB_PATH'] = jedir('lib\\girepository-1.0')
+
+
+def is_wine():
+    try:
+        try:
+            import _winreg as winreg
+        except ImportError:
+            import winreg   #@UnresolvedImport @Reimport
+        hKey = winreg.OpenKey(win32con.HKEY_LOCAL_MACHINE, r"Software\\Wine")
+        return hKey is not None
+    except:
+        #no wine key, assume not present and wait for input
+        pass
+    return False
+
+
+prg_name = "Xpra"
+def set_prgname(name):
+    global prg_name
+    prg_name = name
+    try:
+        SetConsoleTitleA(name)
+        import glib
+        glib.set_prgname(name)
+    except:
+        pass
+
 
 def fix_unicode_out():
     #code found here:
     #http://stackoverflow.com/a/3259271/428751
     import codecs
-    from ctypes import WINFUNCTYPE, windll, POINTER, byref, c_int
-    from ctypes.wintypes import BOOL, HANDLE, DWORD, LPWSTR, LPCWSTR, LPVOID
-
     original_stderr = sys.stderr
 
     # If any exception occurs in this code, we'll probably try to print it on stderr,
@@ -53,15 +112,6 @@ def fix_unicode_out():
         # <http://msdn.microsoft.com/en-us/library/ms683167(VS.85).aspx>
         # BOOL WINAPI GetConsoleMode(HANDLE hConsole, LPDWORD lpMode);
 
-        GetStdHandle = WINFUNCTYPE(HANDLE, DWORD)(("GetStdHandle", windll.kernel32))
-        STD_OUTPUT_HANDLE = DWORD(-11)
-        STD_ERROR_HANDLE = DWORD(-12)
-        GetFileType = WINFUNCTYPE(DWORD, DWORD)(("GetFileType", windll.kernel32))
-        FILE_TYPE_CHAR = 0x0002
-        FILE_TYPE_REMOTE = 0x8000
-        GetConsoleMode = WINFUNCTYPE(BOOL, HANDLE, POINTER(DWORD))(("GetConsoleMode", windll.kernel32))
-        INVALID_HANDLE_VALUE = DWORD(-1).value
-
         def not_a_console(handle):
             if handle == INVALID_HANDLE_VALUE or handle is None:
                 return True
@@ -75,8 +125,6 @@ def fix_unicode_out():
         if hasattr(sys.stderr, 'fileno'):
             old_stderr_fileno = sys.stderr.fileno()
 
-        STDOUT_FILENO = 1
-        STDERR_FILENO = 2
         real_stdout = (old_stdout_fileno == STDOUT_FILENO)
         real_stderr = (old_stderr_fileno == STDERR_FILENO)
 
@@ -93,8 +141,6 @@ def fix_unicode_out():
         if real_stdout or real_stderr:
             # BOOL WINAPI WriteConsoleW(HANDLE hOutput, LPWSTR lpBuffer, DWORD nChars,
             #                           LPDWORD lpCharsWritten, LPVOID lpReserved);
-
-            WriteConsoleW = WINFUNCTYPE(BOOL, HANDLE, LPWSTR, DWORD, POINTER(DWORD), LPVOID)(("WriteConsoleW", windll.kernel32))
 
             class UnicodeOutput:
                 def __init__(self, hConsole, stream, fileno, name):
@@ -172,14 +218,126 @@ def fix_unicode_out():
     except Exception as e:
         _complain("exception %r while fixing up sys.stdout and sys.stderr" % (e,))
 
+class COORD(ctypes.Structure):
+    _fields_ = [
+        ('X', ctypes.c_short),
+        ('Y', ctypes.c_short)
+        ]
+
+class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSize",              COORD),
+        ("dwCursorPosition",    COORD),
+        ("wAttributes",         WORD),
+        ("srWindow",            SMALL_RECT),
+        ("dwMaximumWindowSize", COORD),
+        ]
+
+_wait_for_input = False
+def set_wait_for_input():
+    global _wait_for_input
+    if is_wine():
+        #don't wait for input when running under wine
+        #(which usually does not popup a new shell window)
+        _wait_for_input = False
+        return
+    if os.environ.get("MSYSCON"):
+        #msys environment doesn't popup a new shell window
+        _wait_for_input = False
+        return
+    try:
+        handle = GetStdHandle(STD_OUTPUT_HANDLE)
+        #handle.SetConsoleTextAttribute(FOREGROUND_BLUE)
+        csbi = CONSOLE_SCREEN_BUFFER_INFO()
+        GetConsoleScreenBufferInfo(handle, byref(csbi))
+        cpos = csbi.dwCursorPosition
+        #wait for input if this is a brand new console:
+        _wait_for_input = cpos.X==0 and cpos.Y==0
+    except:
+        e = sys.exc_info()[1]
+        code = -1
+        try:
+            code = e.winerror
+        except:
+            pass
+        if code==errno.ENXIO:
+            #ignore "no device" errors silently
+            #(ie: happens if you redirect the command to a file)
+            #we could also re-use the code above from "not_a_console()"
+            pass
+        else:
+            try:
+                print("error accessing console %s: %s" % (errno.errorcode.get(e.errno, e.errno), e))
+            except:
+                print("error accessing console: %s" % e)
 
 def do_init():
     if not REDIRECT_OUTPUT:
-        fix_unicode_out()
+        FIX_UNICODE_OUT = envbool("XPRA_FIX_UNICODE_OUT", True)
+        if PYTHON2 and FIX_UNICODE_OUT:
+            #don't know why this breaks with Python 3 yet...
+            fix_unicode_out()
+        #figure out if we want to wait for input at the end:
+        set_wait_for_input()
         return
-    global LOG_FILENAME
+    from xpra.platform import get_prgname
+    LOG_FILENAME = (get_prgname() or "Xpra")+".log"
     from paths import _get_data_dir
     d = _get_data_dir()
     log_file = os.path.join(d, LOG_FILENAME)
     sys.stdout = open(log_file, "a")
     sys.stderr = sys.stdout
+
+
+MB_ICONEXCLAMATION  = 0x00000030
+MB_ICONINFORMATION  = 0x00000040
+MB_SYSTEMMODAL      = 0x00001000
+def _show_message(message, uType):
+    global prg_name
+    #TODO: detect cx_freeze equivallent
+    from xpra.util import envbool
+    SHOW_MESSAGEBOX = envbool("XPRA_MESSAGEBOX", True)
+    if SHOW_MESSAGEBOX and REDIRECT_OUTPUT:
+        #try to use an alert box since no console output will be shown:
+        try:
+            MessageBoxA(0, message, prg_name, uType)
+            return
+        except:
+            pass
+    print(message)
+
+def command_info(message):
+    _show_message(message, MB_ICONINFORMATION | MB_SYSTEMMODAL)
+
+def command_error(message):
+    _show_message(message, MB_ICONEXCLAMATION | MB_SYSTEMMODAL)
+
+
+def get_main_fallback():
+    set_wait_for_input()
+    global _wait_for_input
+    if _wait_for_input:
+        #something will be shown in a console,
+        #so don't bother showing anything else
+        return None
+    #try the launcher (better than nothing!)
+    try:
+        from xpra.client.gtk_base.client_launcher import main
+        return main
+    except:
+        return None
+
+
+def do_clean():
+    global _wait_for_input
+    if _wait_for_input:
+        print("\nPress Enter to close")
+        try:
+            sys.stdout.flush()
+        except:
+            pass
+        try:
+            sys.stderr.flush()
+        except:
+            pass
+        sys.stdin.readline()

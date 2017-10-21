@@ -1,6 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2011 Serviware (Arthur Huillet, <ahuillet@serviware.com>)
-# Copyright (C) 2010-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2010-2015 Antoine Martin <antoine@devloop.org.uk>
 # Copyright (C) 2008, 2010 Nathaniel Smith <njs@pobox.com>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
@@ -9,66 +9,114 @@
 from gi.repository import GObject               #@UnresolvedImport @UnusedImport
 from gi.repository import Gtk                   #@UnresolvedImport @UnusedImport
 from gi.repository import Gdk                   #@UnresolvedImport @UnusedImport
+from gi.repository import GdkPixbuf             #@UnresolvedImport @UnusedImport
 
-from xpra.client.gtk_base.cairo_backing import CairoBacking
+from xpra.client.gtk3.cairo_backing import CairoBacking
 from xpra.client.gtk_base.gtk_client_window_base import GTKClientWindowBase, HAS_X11_BINDINGS
-from xpra.client.client_window_base import DRAW_DEBUG
+from xpra.gtk_common.gtk_util import WINDOW_NAME_TO_HINT, WINDOW_EVENT_MASK, BUTTON_MASK
+from xpra.os_util import bytestostr
 from xpra.log import Logger
-log = Logger()
+log = Logger("gtk", "window")
+paintlog = Logger("paint")
+metalog = Logger("metadata")
+
+
+GTK3_OR_TYPE_HINTS = (Gdk.WindowTypeHint.DIALOG,
+                      Gdk.WindowTypeHint.MENU,
+                      Gdk.WindowTypeHint.TOOLBAR,
+                      #Gdk.WindowTypeHint.SPLASHSCREEN,
+                      #Gdk.WindowTypeHint.UTILITY,
+                      #Gdk.WindowTypeHint.DOCK,
+                      #Gdk.WindowTypeHint.DESKTOP,
+                      Gdk.WindowTypeHint.DROPDOWN_MENU,
+                      Gdk.WindowTypeHint.POPUP_MENU,
+                      Gdk.WindowTypeHint.TOOLTIP,
+                      #Gdk.WindowTypeHint.NOTIFICATION,
+                      Gdk.WindowTypeHint.COMBO,
+                      Gdk.WindowTypeHint.DND)
 
 
 """
 GTK3 version of the ClientWindow class
 """
-class ClientWindow(GTKClientWindowBase):
+class ClientWindow(GTKClientWindowBase, Gtk.Window):
 
-    WINDOW_POPUP = Gtk.WindowType.POPUP
-    WINDOW_TOPLEVEL = Gtk.WindowType.TOPLEVEL
-    #where have those values gone?
-    #gi/pygtk3 docs are terrible for this
-    WINDOW_EVENT_MASK = 0
-    OR_TYPE_HINTS = []
-    NAME_TO_HINT = { }
-    SCROLL_MAP = {}
+    __gsignals__ = GTKClientWindowBase.__common_gsignals__
+
+
+    WINDOW_EVENT_MASK   = WINDOW_EVENT_MASK
+    BUTTON_MASK         = BUTTON_MASK
+    OR_TYPE_HINTS       = GTK3_OR_TYPE_HINTS
+    NAME_TO_HINT        = WINDOW_NAME_TO_HINT
 
     WINDOW_STATE_FULLSCREEN = Gdk.WindowState.FULLSCREEN
     WINDOW_STATE_MAXIMIZED  = Gdk.WindowState.MAXIMIZED
     WINDOW_STATE_ICONIFIED  = Gdk.WindowState.ICONIFIED
+    WINDOW_STATE_ABOVE      = Gdk.WindowState.ABOVE
+    WINDOW_STATE_BELOW      = Gdk.WindowState.BELOW
+    WINDOW_STATE_STICKY     = Gdk.WindowState.STICKY
 
 
-    def init_window(self, metadata):
-        #TODO: no idea how to do the window-type with gtk3
-        #maybe not even be possible..
-        Gtk.Window.__init__(self)
-        GTKClientWindowBase.init_window(self, metadata)
+    def do_init_window(self, window_type):
+        Gtk.Window.__init__(self, type = window_type)
         # tell KDE/oxygen not to intercept clicks
         # see: https://bugs.kde.org/show_bug.cgi?id=274485
         # does not work with gtk3? what the??
-        #self.set_data(strtobytes("_kde_no_window_grab"), 1)
+        # they moved it gobject, then removed it, unbelievable:
+        # https://bugzilla.gnome.org/show_bug.cgi?id=641944
+        #self.set_data("_kde_no_window_grab", 1)
+        def motion(w, event):
+            self.do_motion_notify_event(event)
+            return True
+        self.connect("motion-notify-event", motion)
+        def press(w, event):
+            self.do_button_press_event(event)
+            return True
+        self.connect("button-press-event", press)
+        def release(w, event):
+            self.do_button_release_event(event)
+            return True
+        self.connect("button-release-event", release)
+        def scroll(w, event):
+            self.do_scroll_event(event)
+            return True
+        self.connect("scroll-event", scroll)
 
-    def new_backing(self, w, h):
-        self._backing = self.make_new_backing(CairoBacking, w, h)
+    def get_backing_class(self):
+        return CairoBacking
+
+    def enable_alpha(self):
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual is None or not screen.is_composited():
+            log.error("enable_alpha() cannot handle window transparency on screen %s", screen)
+            return False
+        log("enable_alpha() using rgba visual %s for wid %s", visual, self._id)
+        self.set_visual(visual)
+        return True
 
 
     def xget_u32_property(self, target, name):
+        if HAS_X11_BINDINGS:
+            return GTKClientWindowBase.xget_u32_property(self, target, name)
+        #pure Gdk lookup:
         try:
-            if not HAS_X11_BINDINGS:
-                name_atom = Gdk.Atom.intern(name, False)
-                type_atom = Gdk.Atom.intern("CARDINAL", False)
-                prop = Gdk.property_get(target, name_atom, type_atom, 0, 9999, False)
-                if not prop or len(prop)!=3 or len(prop[2])!=1:
-                    return  None
-                log("xget_u32_property(%s, %s)=%s", target, name, prop[2][0])
-                return prop[2][0]
-        except Exception, e:
-            log.error("xget_u32_property error on %s / %s: %s", target, name, e)
-        return GTKClientWindowBase.xget_u32_property(self, target, name)
+            name_atom = Gdk.Atom.intern(name, False)
+            type_atom = Gdk.Atom.intern("CARDINAL", False)
+            prop = Gdk.property_get(target, name_atom, type_atom, 0, 9999, False)
+            if not prop or len(prop)!=3 or len(prop[2])!=1:
+                return  None
+            metalog("xget_u32_property(%s, %s)=%s", target, name, prop[2][0])
+            return prop[2][0]
+        except Exception as e:
+            metalog.error("xget_u32_property error on %s / %s: %s", target, name, e)
 
     def is_mapped(self):
         return self.get_mapped()
 
     def get_window_geometry(self):
-        x, y = self.get_position()
+        gdkwindow = self.get_window()
+        x, y = gdkwindow.get_origin()[1:]
         w, h = self.get_size()
         return (x, y, w, h)
 
@@ -102,23 +150,30 @@ class ClientWindow(GTKClientWindowBase):
         geom = Gdk.Geometry()
         mask = 0
         for k,v in hints.items():
+            k = bytestostr(k)
             if k in INT_FIELDS:
+                if k.find("width")>=0:
+                    v = self._client.sx(v)
+                elif k.find("height")>=0:
+                    v = self._client.sy(v)
+                elif k.find("size")>=0:
+                    v = self._client.sp(v)
                 setattr(geom, k, int(v))
                 mask |= int(name_to_hint.get(k, 0))
             elif k in ASPECT_FIELDS:
                 field = ASPECT_FIELDS.get(k)
                 setattr(geom, field, float(v))
                 mask |= int(name_to_hint.get(k, 0))
-        hints = Gdk.WindowHints(mask)
-        self.set_geometry_hints(None, geom, hints)
+        gdk_hints = Gdk.WindowHints(mask)
+        metalog("apply_geometry_hints(%s) geometry=%s, hints=%s", hints, geom, gdk_hints)
+        self.set_geometry_hints(None, geom, gdk_hints)
 
 
     def queue_draw(self, x, y, width, height):
         self.queue_draw_area(x, y, width, height)
 
     def do_draw(self, context):
-        if DRAW_DEBUG:
-            log.info("do_draw(%s)", context)
+        paintlog("do_draw(%s)", context)
         if self.get_mapped() and self._backing:
             self._backing.cairo_draw(context)
 

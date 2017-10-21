@@ -1,6 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2008 Nathaniel Smith <njs@pobox.com>
-# Copyright (C) 2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2013, 2014 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -60,13 +60,12 @@
 # timeout. If the user ever stops pasting madly for a few seconds, though,
 # then everything should have a chance to return to equilibrium...
 
-from xpra.gtk_common.gobject_compat import import_gobject, import_gtk
-gobject = import_gobject()
+from xpra.gtk_common.gobject_compat import import_glib, import_gtk
+glib = import_glib()
 gtk = import_gtk()
 
-from xpra.log import Logger, debug_if_env
-log = Logger()
-debug = debug_if_env(log, "XPRA_NESTED_DEBUG")
+from xpra.log import Logger
+log = Logger("gtk")
 
 # For debugging:
 def _dump_recursion_info():
@@ -99,12 +98,12 @@ class NestedMainLoop(object):
     _stack = []
 
     def __str(self):
-        return  "NestedMainLoop(%s)" % hex(id(self))
+        return  "NestedMainLoop(%#x)" % id(self)
 
     @classmethod
     def _quit_while_top_done(cls):
         if len(cls._stack)==0:
-            debug("NestedMainLoop: no more nested loops")
+            log("NestedMainLoop: no more nested loops")
             #no more nested loops
             return False
         assert gtk.main_level()>1
@@ -113,32 +112,32 @@ class NestedMainLoop(object):
         #we need to pop the ones above it that have timedout,
         #starting with "top", so we can get to it:
         done_pending = bool([o for o in cls._stack if o!=top and o._done])
-        debug("NestedMainLoop: top loop=%s, done=%s, soft timeout=%s, hard timeout=%s, done_pending=%s",
-            hex(id(top)), top._done, top._hard_timed_out, top._soft_timed_out, done_pending)
+        log("NestedMainLoop: top loop=%#x, done=%s, soft timeout=%s, hard timeout=%s, done_pending=%s",
+            id(top), top._done, top._hard_timed_out, top._soft_timed_out, done_pending)
         if top._done or top._hard_timed_out or \
             (top._soft_timed_out and done_pending):
-            debug("exiting nested main loop %s, leaving level %s",
-                hex(id(top)), gtk.main_level())
+            log("exiting nested main loop %#x, leaving level %s",
+                id(top), gtk.main_level())
             gtk.main_quit()
             return True     #check new top of stack again
         #not done / timedout yet:
         return False
 
     def _wakeup(self):
-        gobject.timeout_add(0, self._quit_while_top_done)
+        glib.timeout_add(0, self._quit_while_top_done)
 
     def _soft_timeout_cb(self):
-        debug("%s: soft timeout", hex(id(self)))
+        log("%#x: soft timeout", id(self))
         self._soft_timed_out = True
         self._wakeup()
 
     def _hard_timeout_cb(self):
-        debug("%s: hard timeout", hex(id(self)))
+        log("%#x: hard timeout", id(self))
         self._hard_timed_out = True
         self._wakeup()
 
     def done(self, result):
-        debug("%s: done: %s", hex(id(self)), result)
+        log("%#x: done: %s", id(self), result)
         self._result = result
         self._done = True
         self._wakeup()
@@ -151,17 +150,19 @@ class NestedMainLoop(object):
         self._soft_timed_out = False
         self._hard_timed_out = False
         self._stack.append(self)
-        soft = gobject.timeout_add(soft_timeout, self._soft_timeout_cb)
-        hard = gobject.timeout_add(hard_timeout, self._hard_timeout_cb)
-        debug("Entering nested loop %s (level %s)",
-            hex(id(self)), gtk.main_level())
+        soft = glib.timeout_add(soft_timeout, self._soft_timeout_cb)
+        hard = glib.timeout_add(hard_timeout, self._hard_timeout_cb)
+        log("Entering nested loop %#x (level %s)",
+            id(self), gtk.main_level())
         try:
             gtk.main()
-            debug("%s: returned from nested main loop", hex(id(self)))
+            log("%#x: returned from nested main loop", id(self))
         finally:
             assert self._stack.pop() is self
-            gobject.source_remove(soft)
-            gobject.source_remove(hard)
-        debug("%s: done=%s, soft=%s, hard=%s, result=%s",
-            hex(id(self)), self._done, self._soft_timed_out, self._hard_timed_out, self._result)
+            if not self._soft_timed_out:
+                glib.source_remove(soft)
+            if not self._hard_timed_out:
+                glib.source_remove(hard)
+        log("%s: done=%#x, soft=%s, hard=%s, result=%s",
+            id(self), self._done, self._soft_timed_out, self._hard_timed_out, self._result)
         return self._result

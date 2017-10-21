@@ -1,6 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2008, 2009 Nathaniel Smith <njs@pobox.com>
-# Copyright (C) 2010-2013 Antoine Martin <antoine@devloop.org.uk>
+# Copyright (C) 2010-2014 Antoine Martin <antoine@devloop.org.uk>
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -8,20 +8,24 @@
 # split from bindings.pyx as this needs to be built on win32 too
 # and win32 does not have all the X11 stuff
 
+#cython: wraparound=False
+
 import gobject
 import gtk
 import gtk.gdk
 
+from libc.stdint cimport uintptr_t
+
 from xpra.log import Logger
-log = Logger()
+log = Logger("gtk")
 
 ###################################
 # Headers, python magic
 ###################################
 # Serious black magic happens here (I owe these guys beers):
 cdef extern from "pygobject.h":
-    void init_pygobject()
-init_pygobject()
+    void pygobject_init(int req_major, int req_minor, int req_micro)
+pygobject_init(-1, -1, -1)
 
 cdef extern from "pygtk/pygtk.h":
     void init_pygtk()
@@ -29,7 +33,6 @@ init_pygtk()
 # Now all the macros in those header files will work.
 
 cdef extern from "Python.h":
-    ctypedef int Py_ssize_t
     int PyObject_AsReadBuffer(object obj,
                               void ** buffer,
                               Py_ssize_t * buffer_len) except -1
@@ -61,7 +64,7 @@ def gdk_atom_objects_from_gdk_atom_array(atom_string):
     assert PyObject_AsReadBuffer(atom_string, <const void**> &array, &array_len_bytes)==0
     array_len = array_len_bytes / sizeof(GdkAtom)
     objects = []
-    for i in xrange(array_len):
+    for i in range(array_len):
         if array[i]==GDK_NONE:
             continue
         gdk_atom = PyGdkAtom_New(array[i])
@@ -75,6 +78,6 @@ def gdk_atom_array_from_gdk_atom_objects(gdk_atom_objects):
     for atom_object in gdk_atom_objects:
         c_gdk_atom = PyGdkAtom_Get(atom_object)
         if c_gdk_atom!=GDK_NONE:
-            gdk_atom_value = <unsigned long> c_gdk_atom
+            gdk_atom_value = <uintptr_t> c_gdk_atom
             atom_array.append(gdk_atom_value)
     return atom_array

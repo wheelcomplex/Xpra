@@ -3,23 +3,25 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
-#preserve the spaces below to make it easier to apply patches:
-
-
-
-LOCAL_SERVERS_SUPPORTED = True
-
-
-
-SHADOW_SUPPORTED = True
-
-
-
 #don't bother trying to forward system tray with Ubuntu's "unity":
-from xpra.platform.xposix.appindicator_tray import is_unity
+from xpra.os_util import is_unity, PYTHON2
 SYSTEM_TRAY_SUPPORTED = not is_unity()
-MMAP_SUPPORTED = True
-CAN_DAEMONIZE = True
+
+SHADOW_SUPPORTED = PYTHON2
+
+DEFAULT_ENV = [
+             "#avoid Ubuntu's global menu, which is a mess and cannot be forwarded:",
+             "UBUNTU_MENUPROXY=",
+             "QT_X11_NO_NATIVE_MENUBAR=1",
+             "#fix for MainSoft's MainWin buggy window management:",
+             "MWNOCAPTURE=true",
+             "MWNO_RIT=true",
+             "MWWM=allwm",
+             "#force GTK3 applications to use X11 so we can intercept them:",
+             "GDK_BACKEND=x11",
+             ]
+
 DEFAULT_SSH_CMD = "ssh"
-GOT_PASSWORD_PROMPT_SUGGESTION = "Perhaps you need to set up your ssh agent?\n"
 CLIPBOARDS=["CLIPBOARD", "PRIMARY", "SECONDARY"]
+
+INPUT_DEVICES = ["auto", "xi"]
